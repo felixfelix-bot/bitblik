@@ -10,6 +10,11 @@
  *   produced by someone in the ring, and can detect if the same taker tries
  *   to reuse a proof (via the key image / nullifier).
  *
+ *   The proof travels as a NIP-01 event (kind 30221): the envelope is
+ *   schnorr-signed by a fresh EPHEMERAL publisher key — not a ring
+ *   member — with the LSAG proof inside the content, so the relay
+ *   never learns which ring member signed.
+ *
  * Flow:
  *   1. Setup 5 keypairs (the ring of makers).
  *   2. Taker (one of the makers, acting as code provider) signs a message.
@@ -38,8 +43,9 @@ import {
   verify,
   type LSAGSignature,
 } from "./lsag.js";
-import { secp256k1 } from "@noble/curves/secp256k1";
+import { secp256k1, schnorr } from "@noble/curves/secp256k1";
 import { sha256 } from "@noble/hashes/sha256";
+import { bytesToHex, hexToBytes } from "@noble/hashes/utils";
 import { readSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { bech32 } from "@scure/base";
@@ -106,25 +112,71 @@ function timed<T>(fn: () => T): { result: T; ms: string } {
   return { result, ms: (performance.now() - t0).toFixed(2) };
 }
 
-/** Build the demo Nostr event (custom kind 30221) carrying the proof. */
-function buildNostrEvent(
-  takerXOnly: string,
+/** A real NIP-01 event: canonical id + schnorr sig by the publisher. */
+export interface SignedNostrEvent {
+  id: string;
+  pubkey: string;
+  created_at: number;
+  kind: number;
+  tags: string[][];
+  content: string;
+  sig: string;
+}
+
+/** Throwaway publisher keypair — fresh per demo run, never a ring member. */
+export interface PublisherKeypair {
+  /** 32-byte secret scalar; signs the envelope once, then is discarded. */
+  secretKey: Uint8Array;
+  /** x-only (32-byte) schnorr public key, hex — the NIP-01 `pubkey`. */
+  pubkey: string;
+}
+
+/**
+ * Fresh EPHEMERAL publisher keypair. The LSAG proof is anonymous, so the
+ * envelope must be too: the relay sees (and schnorr-verifies) this
+ * throwaway key — it never learns which ring member signed the proof.
+ */
+export function generatePublisher(): PublisherKeypair {
+  const { secretKey, publicKey } = schnorr.keygen();
+  return { secretKey, pubkey: bytesToHex(publicKey) };
+}
+
+/**
+ * Build the demo Nostr event (custom kind 30221) carrying the ring proof.
+ *
+ * - id: canonical NIP-01 sha256 over [0,pubkey,created_at,kind,tags,content]
+ * - sig: BIP-340 schnorr signature over the id bytes by the ephemeral
+ *   publisher key — what a real relay verifies before storing the event
+ * - d tag: kind 30221 sits in the parameterized-replaceable range
+ *   (30000-39999), so real relays require ['d', offerId]
+ * - ring/names tags: verification ring as hex pubkeys + display names
+ */
+export function buildNostrEvent(
+  publisher: PublisherKeypair,
+  ringPubkeysHex: string[],
   ringNames: string[],
+  offerId: string,
   content: string,
-): { event: Record<string, unknown>; id: string } {
-  const ev = {
+): { event: SignedNostrEvent; id: string } {
+  const base = {
     kind: 30221,
-    pubkey: takerXOnly,
+    pubkey: publisher.pubkey,
     created_at: Math.floor(Date.now() / 1000),
-    tags: [["ring", ...ringNames], ["offer", randomBytes(8).toString("hex")]],
+    tags: [
+      ["ring", ...ringPubkeysHex],
+      ["names", ...ringNames],
+      ["d", offerId],
+    ],
     content,
   };
   // NIP-01 canonical serialization: sha256 of [0,pubkey,created_at,kind,tags,content]
   const serialized = JSON.stringify([
-    0, ev.pubkey, ev.created_at, ev.kind, ev.tags, ev.content,
+    0, base.pubkey, base.created_at, base.kind, base.tags, base.content,
   ]);
   const id = hex(sha256(new TextEncoder().encode(serialized)));
-  return { event: { ...ev, id }, id };
+  // Real envelope: the event id itself is what gets schnorr-signed.
+  const sig = bytesToHex(schnorr.sign(hexToBytes(id), publisher.secretKey));
+  return { event: { ...base, id, sig }, id };
 }
 
 function rolesDiagram(): void {
@@ -406,14 +458,19 @@ export function main(
   ]));
 
   // The proof as it would actually travel: a Nostr event (custom kind).
-  const takerXOnly = hex(keys[takerIndex].publicKey).slice(2); // x-only
-  const npub = bech32.encode(
+  // Fresh EPHEMERAL publisher keypair for THIS run — not a ring member,
+  // so publishing leaks nothing about who signed the LSAG proof.
+  const publisher = generatePublisher();
+  const publisherNpub = bech32.encode(
     "npub",
-    bech32.toWords(Uint8Array.from(Buffer.from(takerXOnly, "hex"))),
+    bech32.toWords(Uint8Array.from(Buffer.from(publisher.pubkey, "hex"))),
   );
+  const offerId = randomBytes(8).toString("hex");
   const { event } = buildNostrEvent(
-    takerXOnly,
+    publisher,
+    ring.map((pk) => hex(pk)),
     keys.map((_, i) => nameOf(i)),
+    offerId,
     JSON.stringify({
       msg: "I am a trusted code provider for bitblik",
       keyImage: hex(sig.keyImage),
@@ -424,10 +481,9 @@ export function main(
   console.log();
   console.log("The proof as a Nostr event — what gets published:");
   console.log(JSON.stringify(event, null, 2));
-  console.log(`taker npub: ${npub}`);
-  console.log("(ring tag shows names for readability — real event carries");
-  console.log(" full 32-byte hex pubkeys; a normal event's schnorr sig is");
-  console.log(" replaced by the LSAG proof: anyone in the ring could sign)");
+  console.log(`publisher npub: ${publisherNpub} (fresh ephemeral key)`);
+  console.log("event envelope schnorr-signed by EPHEMERAL publisher;");
+  console.log("LSAG proof in content — relay never learns which ring member signed.");
 
   // ── 3. Maker verifies the ring signature ─────────────────────
   section("3. Maker (cash withdrawer) verifies the proof", opts);

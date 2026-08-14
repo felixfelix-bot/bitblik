@@ -1,9 +1,13 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { randomBytes } from "node:crypto";
 import { bech32 } from "@scure/base";
-import { secp256k1 } from "@noble/curves/secp256k1";
+import { WebSocket } from "ws";
+import { secp256k1, schnorr } from "@noble/curves/secp256k1";
+import { sha256 } from "@noble/hashes/sha256";
+import { bytesToHex, hexToBytes } from "@noble/hashes/utils";
 import {
   main,
   parseArgs,
@@ -11,8 +15,11 @@ import {
   decodeNpub,
   npubToRingPubkey,
   parseNpubArgs,
+  generatePublisher,
+  buildNostrEvent,
 } from "./demo.js";
 import { generateKeyPair, sign, verify } from "./lsag.js";
+import { startRelay } from "./relay.js";
 
 // ─── Helpers ───────────────────────────────────────────────────
 
@@ -397,4 +404,106 @@ describe("CLI end-to-end (--npub)", () => {
     expect(err.stderr ?? "").toMatch(/Invalid npub/i);
     expect(err.stdout ?? "").not.toContain("Trust Proof Demo");
   }, 90_000);
+});
+
+// ─── R2: real NIP-01 event envelope ────────────────────────────
+
+describe("NIP-01 signed envelope (R2)", () => {
+  // Static ring fixture: 5 maker keys, exactly like the demo's own ring.
+  const keys = Array.from({ length: 5 }, () => generateKeyPair());
+  const ringHex = keys.map((k) => bytesToHex(k.publicKey));
+  const names = ["Alice", "Bob", "Carol", "Dave", "Erin"];
+  const offerId = randomBytes(8).toString("hex");
+  const content = JSON.stringify({ msg: "I am a trusted code provider for bitblik" });
+
+  // Fresh ephemeral publisher per test — mirrors "per demo run".
+  let publisher: ReturnType<typeof generatePublisher>;
+
+  beforeEach(() => {
+    publisher = generatePublisher();
+  });
+
+  function build() {
+    return buildNostrEvent(publisher, ringHex, names, offerId, content);
+  }
+
+  it("sig is present (128 hex chars = 64 BIP-340 bytes) and schnorr.verify(sig, id, pubkey) passes", () => {
+    const { event, id } = build();
+    expect(event.sig).toMatch(/^[0-9a-f]{128}$/);
+    expect(schnorr.verify(hexToBytes(event.sig), hexToBytes(id), event.pubkey)).toBe(true);
+  });
+
+  it("id equals canonical sha256 over [0,pubkey,created_at,kind,tags,content]", () => {
+    const { event, id } = build();
+    const serialized = JSON.stringify([
+      0, event.pubkey, event.created_at, event.kind, event.tags, event.content,
+    ]);
+    expect(id).toBe(bytesToHex(sha256(new TextEncoder().encode(serialized))));
+    expect(event.id).toBe(id);
+  });
+
+  it("d tag present: ['d', offerId] (kind 30221 is parameterized-replaceable)", () => {
+    const { event } = build();
+    expect(event.tags).toContainEqual(["d", offerId]);
+  });
+
+  it("pubkey is the EPHEMERAL publisher — not a ring member", () => {
+    const { event } = build();
+    expect(event.pubkey).toBe(publisher.pubkey);
+    // Neither the full compressed hex nor the x-only form of any ring
+    // member may appear as the event pubkey.
+    for (const pk of ringHex) {
+      expect(event.pubkey).not.toBe(pk);
+      expect(event.pubkey).not.toBe(pk.slice(2));
+    }
+  });
+
+  it("ring pubkeys carried as hex tag + names tag for display", () => {
+    const { event } = build();
+    expect(event.tags).toContainEqual(["ring", ...ringHex]);
+    expect(event.tags).toContainEqual(["names", ...names]);
+  });
+
+  it("generatePublisher returns a fresh keypair on every call", () => {
+    const a = generatePublisher();
+    const b = generatePublisher();
+    expect(a.pubkey).toMatch(/^[0-9a-f]{64}$/);
+    expect(a.pubkey).not.toBe(b.pubkey);
+    expect(bytesToHex(a.secretKey)).not.toBe(bytesToHex(b.secretKey));
+  });
+
+  it("demo narration: envelope schnorr-signed by EPHEMERAL publisher", () => {
+    const out = captureMainOutput([]);
+    expect(out).toContain("EPHEMERAL publisher");
+    expect(out).toContain("relay never learns which ring member signed");
+  });
+
+  it("R1 relay accepts the signed event over a real socket: ['OK', id, true]", async () => {
+    const { event } = build();
+    const relay = await startRelay({ port: 0 });
+    try {
+      const ok = await new Promise<unknown[]>((resolve, reject) => {
+        const ws = new WebSocket(`ws://127.0.0.1:${relay.port}`);
+        const timer = setTimeout(
+          () => reject(new Error("timeout waiting for OK")),
+          5_000,
+        );
+        ws.once("open", () => ws.send(JSON.stringify(["EVENT", event])));
+        ws.once("error", (err: Error) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+        ws.on("message", (data: unknown) => {
+          clearTimeout(timer);
+          ws.terminate();
+          resolve(JSON.parse(String(data)) as unknown[]);
+        });
+      });
+      expect(ok[0]).toBe("OK");
+      expect(ok[1]).toBe(event.id);
+      expect(ok[2]).toBe(true);
+    } finally {
+      await relay.close();
+    }
+  }, 10_000);
 });
