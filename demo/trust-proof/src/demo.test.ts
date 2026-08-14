@@ -76,6 +76,18 @@ describe("demo", () => {
     expect(out.indexOf("0. The roles")).toBeLessThan(out.indexOf("1. Setup"));
   });
 
+  it("roles diagram flow: proof BEFORE sats, BLIK code LAST", () => {
+    const out = captureMainOutput([]);
+    const iProof = out.indexOf("2) ring signature proof");
+    const iSats = out.indexOf("3) sats over Lightning");
+    const iCode = out.indexOf("4) BLIK code");
+    expect(iProof).toBeGreaterThan(-1);
+    expect(iSats).toBeGreaterThan(-1);
+    expect(iCode).toBeGreaterThan(-1);
+    expect(iProof).toBeLessThan(iSats);
+    expect(iSats).toBeLessThan(iCode);
+  });
+
   it("explains THE PROBLEM before the roles", () => {
     const out = captureMainOutput([]);
     expect(out).toContain("The problem");
