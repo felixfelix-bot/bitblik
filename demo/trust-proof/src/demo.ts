@@ -41,6 +41,11 @@
  *                  connects to one already running there (EADDRINUSE).
  *   --offline      keep the old print-only path: no relay, no sockets.
  *
+ * Companion entries (R4):
+ *   npm run relay       standalone relay in its own terminal — the demo
+ *                       auto-detects it on the same port (two-terminal mode)
+ *   npm run preflight   ~1s confidence check: relay → publish → REQ → verify
+ *
  * Environment:
  *   TRUST_DEMO_RELAY_PORT  relay port override (default 10547) — used by
  *                          tests and by a second demo run beside the first.
@@ -382,9 +387,10 @@ const WS_TIMEOUT_MS = 3_000;
 
 /**
  * Desired relay port. TRUST_DEMO_RELAY_PORT overrides the default 10547 —
- * used by tests, and by humans running a second demo beside the first.
+ * used by tests, by `npm run relay` (the standalone entry), and by humans
+ * running a second demo beside the first.
  */
-function relayPort(): number {
+export function relayPort(): number {
   const raw = process.env.TRUST_DEMO_RELAY_PORT;
   if (raw === undefined || raw === "") return DEFAULT_RELAY_PORT;
   const n = Number.parseInt(raw, 10);
@@ -525,8 +531,10 @@ async function relayFetchProof(url: string, expectedId: string): Promise<NostrEv
  * Rebuild the verification inputs strictly from what crossed the wire:
  * ring pubkeys from the `ring` tag, the LSAG proof from event content.
  * Nothing from the taker's local variables.
+ *
+ * Exported since R4: `npm run preflight` runs the same maker-side rebuild.
  */
-function proofFromWireEvent(
+export function proofFromWireEvent(
   ev: NostrEvent,
 ): { ring: Uint8Array[]; sig: LSAGSignature; message: Uint8Array } {
   const ringTag = ev.tags.find((t) => t[0] === "ring");

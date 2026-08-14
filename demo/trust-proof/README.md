@@ -265,6 +265,10 @@ npm run demo
 # or: npx tsx src/demo.ts
 ```
 
+The proof travels over a REAL Nostr transport by default: the demo embeds
+the [in-repo relay](#the-in-repo-relay-nip-01-subset) and ships the signed
+kind 30221 event over a WebSocket — publish, REQ, verify from the wire.
+
 ### Demo Flags
 
 | Flag | Effect |
@@ -272,6 +276,66 @@ npm run demo
 | `--interactive` | Pause after each section header (`[Enter] to continue...`) — paces a live demo |
 | `--quick` | Collapse the four security checks into one summary line (`All 4 security checks passed: ✅`) |
 | `--npub npub1... [npub1... ...]` | Insert participant npubs into the ring as anonymous decoys before signing (repeatable flag) |
+| `--relay` | Real Nostr WS transport — this is the DEFAULT; the flag is accepted for explicitness |
+| `--offline` | Print-only path: no relay, no sockets (pre-transport behavior; if both flags appear, `--offline` wins) |
+
+### Preflight — one-line confidence check
+
+```bash
+npm run preflight
+# preflight OK — relay publish → REQ → verify (id + schnorr + LSAG) green (142 ms)
+```
+
+A ~200ms–3s smoke test of the FULL stack: LSAG sign → NIP-01 envelope
+(ephemeral publisher + schnorr) → throwaway relay → publish over WS → REQ
+back over WS → verify (canonical id recompute, schnorr envelope, LSAG proof
+rebuilt from the wire). Exactly one line of output, exit 0/1, and a hard
+watchdog so it can never hang. The throwaway relay binds an ephemeral port,
+so preflight never touches port 10547 — safe to run beside a live demo or
+a standalone relay.
+
+### The In-Repo Relay (NIP-01 subset)
+
+**What it is.** A minimal Nostr relay server ([`src/relay.ts`](src/relay.ts),
+~200 lines on the `ws` library) that lives in this repo. The demo embeds it
+in-process on port 10547, so the proof genuinely crosses a WebSocket using
+the NIP-01 message grammar — the same bytes a public relay would see.
+
+**Why in-repo.** A stage demo cannot depend on a third-party public relay:
+venue Wi-Fi, rate limits, other people's events in the replay, and trust in
+someone else's server. The in-repo relay keeps the transport REAL (frames
+over a socket) while staying deterministic, junk-free, and fully offline.
+And it is still best-effort: on any transport failure the demo prints
+`[!] relay unavailable, offline mode` and completes locally — the show
+cannot break.
+
+**NIP-01 subset behavior.**
+
+- `["EVENT", event]` — the relay recomputes the canonical id (sha256 over
+  `[0, pubkey, created_at, kind, tags, content]`) and rejects mismatches.
+  Valid events are stored and broadcast to all matching live subscriptions;
+  duplicates get `["OK", id, true, "duplicate: ..."]`. Server-side schnorr
+  verification is intentionally skipped — the envelope signature is verified
+  in the R2 tests and by `npm run preflight`; for a demo transport the id
+  check is sufficient.
+- `["REQ", subId, filter, ...]` — filters are OR'd; `ids` (full or prefix),
+  `kinds`, and `limit` are supported. Stored matches replay oldest-first
+  (per filter, honoring `limit`), then a mandatory `["EOSE", subId]`; the
+  subscription then goes live. A REQ reusing an existing sub id replaces it.
+- `["CLOSE", subId]` — drops the subscription; unknown ids are a no-op.
+- Unknown message types and unparseable frames are ignored.
+
+**Ports.** Default `10547`, overridable with `TRUST_DEMO_RELAY_PORT` (same
+policy for every entry). If the port is already taken, the demo assumes a
+standalone relay owns it and connects as a client — the output says
+`(standalone relay detected)`.
+
+**`npm run relay` — the standalone showpiece.** Runs the same relay module
+as a standalone process in its own terminal. Start it in one window,
+`npm run demo` in the other, and the audience watches a real relay server
+at work while the story unfolds. Ctrl+C stops it cleanly; if the port is
+already owned it exits with a one-line explanation instead of a stack
+trace.
 
 Presenting this demo live? [PRESENTER.md](PRESENTER.md) has a 1-minute script keyed to the `--interactive` pauses and a Q&A cheat sheet.
 
@@ -294,6 +358,7 @@ npx tsc --noEmit
 |---------|---------|
 | `@noble/curves` | secp256k1 curve operations (point multiplication, addition, scalar arithmetic) |
 | `@noble/hashes` | SHA256 and hash-to-curve |
+| `ws` | WebSocket server/client — the in-repo NIP-01 relay and the demo's real transport |
 | `tsx` | TypeScript execution without build step |
 | `vitest` | Test runner |
 | `typescript` | Type checking |

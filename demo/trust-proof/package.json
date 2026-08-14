@@ -8,7 +8,9 @@
     "build": "tsc -p tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest",
-    "demo": "tsx src/demo.ts"
+    "demo": "tsx src/demo.ts",
+    "relay": "tsx src/relay-standalone.ts",
+    "preflight": "tsx src/preflight.ts"
   },
   "dependencies": {
     "@noble/curves": "^1.6.0",

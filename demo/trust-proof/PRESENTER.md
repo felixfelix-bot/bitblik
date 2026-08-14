@@ -15,8 +15,28 @@ then diverge from. Seed/curator, not gatekeeper.
 ```bash
 cd demo/trust-proof
 npm install                       # once
+npm run preflight                 # 1-line confidence check — must print "preflight OK"
 npx tsx src/demo.ts --quick       # dry run — must end "ALL SECURITY CHECKS PASSED"
 ```
+
+`npm run preflight` is the sub-second sanity check for the presenter machine:
+it starts a throwaway relay, publishes a real signed event, REQs it back and
+verifies everything (id + schnorr + LSAG). One line, exit 0, never hangs —
+if it prints `preflight OK`, the whole stack works on this machine.
+
+**The demo cannot break on stage.** The relay transport is best-effort: if
+anything socket-shaped goes wrong, the demo prints
+`[!] relay unavailable, offline mode` and completes on the local path —
+every section still renders and all checks still pass. Worst case is one
+notice line, not a failure (`--offline` forces that path on purpose).
+
+### Two-terminal mode (optional flex)
+
+For brave moments: run `npm run relay` in a second terminal. The demo
+auto-detects it (look for `standalone relay detected`) and publishes to
+THAT relay instead of embedding its own — the audience watches the relay
+server in one window while the story unfolds in the other. Ctrl+C stops
+it cleanly. Skip it if unsure; the demo is complete without it.
 
 Optional hook: collect one audience npub beforehand and pass it as a ring
 decoy — see [The npub hook](#the-npub-hook).
