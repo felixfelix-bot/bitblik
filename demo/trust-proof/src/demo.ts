@@ -753,16 +753,24 @@ export async function main(
     try {
       const session = await openRelaySession(relayPort());
       try {
+        // Stage-visible confirmation: relay is up, one command, real wire.
+        console.log(
+          box("RELAY", [
+            `✓ RELAY LIVE — ws://localhost:${session.port}`,
+            "  proof will travel over a REAL Nostr relay",
+            session.external ? "  (standalone relay detected)" : "  (auto-started by this command)",
+          ]),
+        );
         console.log(
           `relay: ws://localhost:${session.port} — REAL Nostr transport` +
             (session.external ? " (standalone relay detected)" : ""),
         );
         const echoedId = await relayPublish(session.url, event);
         console.log(
-          `taker: EVENT accepted ['OK', id, true] — relay-echoed event id ${truncate(echoedId, 16)}`,
+          `→ taker: EVENT accepted ['OK', id, true] — relay-echoed event id ${truncate(echoedId, 16)}`,
         );
         const wireEvent = await relayFetchProof(session.url, echoedId);
-        console.log("maker: REQ {kinds:[30221]} → proof received over the wire");
+        console.log("← maker: REQ {kinds:[30221]} → proof received over the wire");
         const fromWire = proofFromWireEvent(wireEvent);
         console.log(
           `maker: ring rebuilt from event tags (${fromWire.ring.length} pubkeys) — LSAG proof from event content`,
