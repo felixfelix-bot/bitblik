@@ -1,0 +1,23 @@
+{
+  "name": "trust-proof-demo",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Trust proof demo for bitblik — cryptographic proof of payment trust",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "demo": "tsx src/demo.ts"
+  },
+  "dependencies": {
+    "@noble/curves": "^1.6.0",
+    "@noble/hashes": "^1.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "typescript": "^5.6.3",
+    "tsx": "^4.19.2",
+    "vitest": "^2.1.5"
+  }
+}
