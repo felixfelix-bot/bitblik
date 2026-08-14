@@ -18,7 +18,8 @@
  * Flow:
  *   1. Setup 5 keypairs (the ring of makers).
  *   2. Taker (one of the makers, acting as code provider) signs a message.
- *   3. Maker (cash withdrawer) verifies the ring signature.
+ *   3. Taker PUBLISHES the signed kind 30221 event to a real Nostr relay;
+ *      the maker receives it OVER THE WIRE and verifies (--offline skips).
  *   4. Nullifier reuse detection — same taker signs twice, key image matches.
  *   5. Security checks — wrong key, tampered message, tampered response.
  *
@@ -26,7 +27,7 @@
  *   maker  = cash withdrawer (member of the ring of trusted withdrawers)
  *   taker  = code provider (the one who proves membership via ring sig)
  *
- * Run:  npx tsx src/demo.ts [--interactive] [--quick] [--npub npub1... [npub1... ...]]
+ * Run:  npx tsx src/demo.ts [--interactive] [--quick] [--npub npub1... [npub1... ...]] [--offline]
  *
  * Flags:
  *   --interactive  pause after each section header ("[Enter] to continue...")
@@ -35,6 +36,14 @@
  *                  ring as decoys BEFORE signing. The taker still signs
  *                  with their own key; participants are anonymous ring
  *                  members, not signers.
+ *   --relay        real Nostr WS transport (DEFAULT — no flag needed). The
+ *                  demo starts an in-process relay on port 10547, or
+ *                  connects to one already running there (EADDRINUSE).
+ *   --offline      keep the old print-only path: no relay, no sockets.
+ *
+ * Environment:
+ *   TRUST_DEMO_RELAY_PORT  relay port override (default 10547) — used by
+ *                          tests and by a second demo run beside the first.
  */
 
 import {
@@ -49,6 +58,8 @@ import { bytesToHex, hexToBytes } from "@noble/hashes/utils";
 import { readSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { bech32 } from "@scure/base";
+import { WebSocket } from "ws";
+import { startRelay, type NostrEvent } from "./relay.js";
 
 // ─── ASCII helpers ──────────────────────────────────────────────
 
@@ -237,6 +248,11 @@ export interface PauseOptions {
 export interface MainOptions extends DemoOptions, PauseOptions {
   /** Participant npubs to insert into the ring as decoys (optional). */
   npubs?: string[];
+  /**
+   * Real Nostr relay transport (R3). DEFAULT ON — undefined means true.
+   * Set false (or pass --offline on the CLI) for the print-only path.
+   */
+  relay?: boolean;
 }
 
 export function parseArgs(argv: string[]): DemoOptions {
@@ -244,6 +260,15 @@ export function parseArgs(argv: string[]): DemoOptions {
     interactive: argv.includes("--interactive"),
     quick: argv.includes("--quick"),
   };
+}
+
+/**
+ * Relay transport flag (R3). DEFAULT ON: the demo speaks real Nostr WS
+ * unless --offline is given. --relay is accepted for explicitness (it is
+ * the default); if both flags appear, --offline wins.
+ */
+export function parseRelayMode(argv: string[]): boolean {
+  return !argv.includes("--offline");
 }
 
 /** Read a single keypress (Enter) from stdin; never stalls if stdin is gone. */
@@ -349,11 +374,187 @@ export function parseNpubArgs(argv: string[]): string[] {
   return npubs;
 }
 
+// ─── R3: real Nostr relay transport ────────────────────────────
+
+const DEFAULT_RELAY_PORT = 10547;
+/** Hard cap on EVERY websocket await — the demo must NEVER stall on stage. */
+const WS_TIMEOUT_MS = 3_000;
+
+/**
+ * Desired relay port. TRUST_DEMO_RELAY_PORT overrides the default 10547 —
+ * used by tests, and by humans running a second demo beside the first.
+ */
+function relayPort(): number {
+  const raw = process.env.TRUST_DEMO_RELAY_PORT;
+  if (raw === undefined || raw === "") return DEFAULT_RELAY_PORT;
+  const n = Number.parseInt(raw, 10);
+  return Number.isNaN(n) ? DEFAULT_RELAY_PORT : n;
+}
+
+/** Reject with `what` if `p` does not settle within WS_TIMEOUT_MS. */
+function withDeadline<T>(p: Promise<T>, what: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`${what}: no reply within ${WS_TIMEOUT_MS}ms`));
+    }, WS_TIMEOUT_MS);
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e instanceof Error ? e : new Error(String(e)));
+      },
+    );
+  });
+}
+
+/** Await the socket's open event (bounded by the 3s deadline). */
+function wsOpen(ws: WebSocket): Promise<void> {
+  return withDeadline(
+    new Promise<void>((resolve, reject) => {
+      ws.once("open", () => resolve());
+      ws.once("error", (err: Error) => reject(err));
+      ws.once("close", () => reject(new Error("socket closed before open")));
+    }),
+    "relay connect",
+  );
+}
+
+/** Await the next parsed JSON message (bounded by the 3s deadline). */
+function wsNextMessage(ws: WebSocket): Promise<unknown> {
+  return withDeadline(
+    new Promise<unknown>((resolve, reject) => {
+      ws.once("message", (data: unknown) => resolve(JSON.parse(String(data))));
+      ws.once("error", (err: Error) => reject(err));
+      ws.once("close", () => reject(new Error("socket closed before reply")));
+    }),
+    "relay reply",
+  );
+}
+
+interface RelaySession {
+  port: number;
+  /** What the demo actually connects to. */
+  url: string;
+  /** true → a standalone relay already owns the port; we never close it. */
+  external: boolean;
+  close(): Promise<void>;
+}
+
+/**
+ * Get a relay session on the desired port: bind it ourselves first; if the
+ * port is already taken (EADDRINUSE) assume a standalone relay is running
+ * there and connect to it instead. Any other failure propagates → offline.
+ */
+async function openRelaySession(port: number): Promise<RelaySession> {
+  try {
+    const handle = await startRelay({ port });
+    return {
+      port: handle.port,
+      url: `ws://127.0.0.1:${handle.port}`,
+      external: false,
+      close: () => handle.close(),
+    };
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException)?.code === "EADDRINUSE") {
+      return {
+        port,
+        url: `ws://127.0.0.1:${port}`,
+        external: true,
+        close: async () => {}, // not ours — leave the standalone relay running
+      };
+    }
+    throw e;
+  }
+}
+
+/**
+ * Taker side: publish the signed kind 30221 event; resolve the relay-echoed
+ * event id from the ['OK', id, true] reply.
+ */
+async function relayPublish(url: string, event: SignedNostrEvent): Promise<string> {
+  const ws = new WebSocket(url);
+  ws.on("error", () => {}); // never let a late socket error crash the demo
+  try {
+    await wsOpen(ws);
+    ws.send(JSON.stringify(["EVENT", event]));
+    const reply = await wsNextMessage(ws);
+    if (!Array.isArray(reply) || reply[0] !== "OK" || reply[2] !== true) {
+      throw new Error(`relay rejected the event: ${JSON.stringify(reply)}`);
+    }
+    return String(reply[1]);
+  } finally {
+    ws.terminate();
+  }
+}
+
+/**
+ * Maker side: REQ {kinds:[30221]} and resolve OUR event received over the
+ * wire. Events from earlier runs (a shared standalone relay) are skipped
+ * until the expected id arrives; every wait is deadline-bounded.
+ */
+async function relayFetchProof(url: string, expectedId: string): Promise<NostrEvent> {
+  const ws = new WebSocket(url);
+  ws.on("error", () => {}); // never let a late socket error crash the demo
+  const hardStop = Date.now() + WS_TIMEOUT_MS;
+  try {
+    await wsOpen(ws);
+    ws.send(JSON.stringify(["REQ", "maker", { kinds: [30221] }]));
+    for (;;) {
+      if (Date.now() > hardStop) {
+        throw new Error("relay fetch: expected event never arrived");
+      }
+      const msg = await wsNextMessage(ws);
+      const ev = Array.isArray(msg) && msg[0] === "EVENT" ? msg[2] : undefined;
+      if (
+        typeof ev === "object" && ev !== null &&
+        (ev as NostrEvent).id === expectedId
+      ) {
+        return ev as NostrEvent;
+      }
+      // EOSE or an earlier run's event — keep waiting for ours.
+    }
+  } finally {
+    ws.terminate();
+  }
+}
+
+/**
+ * Rebuild the verification inputs strictly from what crossed the wire:
+ * ring pubkeys from the `ring` tag, the LSAG proof from event content.
+ * Nothing from the taker's local variables.
+ */
+function proofFromWireEvent(
+  ev: NostrEvent,
+): { ring: Uint8Array[]; sig: LSAGSignature; message: Uint8Array } {
+  const ringTag = ev.tags.find((t) => t[0] === "ring");
+  if (ringTag === undefined || ringTag.length < 2) {
+    throw new Error("wire event carries no ring tag");
+  }
+  const body = JSON.parse(ev.content) as {
+    msg: string;
+    keyImage: string;
+    c0: string;
+    responses: string[];
+  };
+  return {
+    ring: ringTag.slice(1).map((pk) => hexToBytes(pk)),
+    sig: {
+      keyImage: hexToBytes(body.keyImage),
+      c0: hexToBytes(body.c0),
+      responses: body.responses.map((r) => hexToBytes(r)),
+    },
+    message: new TextEncoder().encode(body.msg),
+  };
+}
+
 // ─── Demo ───────────────────────────────────────────────────────
 
-export function main(
+export async function main(
   optsIn: MainOptions | string[] = parseArgs(process.argv.slice(2)),
-): void {
+): Promise<void> {
   const enc = new TextEncoder();
 
   // --npub support: main accepts either a raw argv array or an options
@@ -364,7 +565,11 @@ export function main(
   let participantPks: Uint8Array[];
   try {
     opts = Array.isArray(optsIn)
-      ? { ...parseArgs(optsIn), npubs: parseNpubArgs(optsIn) }
+      ? {
+          ...parseArgs(optsIn),
+          relay: parseRelayMode(optsIn),
+          npubs: parseNpubArgs(optsIn),
+        }
       : optsIn;
     npubs = opts.npubs ?? [];
     // Force full validation (bech32 + on-curve) of every npub up front.
@@ -373,6 +578,9 @@ export function main(
     console.error(`Error: ${e instanceof Error ? e.message : String(e)}`);
     process.exit(1);
   }
+
+  // R3: relay transport is DEFAULT ON; --offline keeps the print-only path.
+  const relayOn = opts.relay ?? true;
 
   console.log();
   console.log("=".repeat(BOX_WIDTH));
@@ -485,6 +693,39 @@ export function main(
   console.log("event envelope schnorr-signed by EPHEMERAL publisher;");
   console.log("LSAG proof in content — relay never learns which ring member signed.");
 
+  // ── Presenter pointing panel: map every field to its meaning ──
+  console.log();
+  console.log(
+    box("READ THIS EVENT — field-by-field pointing guide", [
+      "",
+      '  "tags"  → 5 "p" entries = THE TRUST RING.',
+      "     5 public keys. One belongs to the real signer.",
+      "     Point at each: could be ANY of them.",
+      "",
+      '  "content".keyImage → DOUBLE-SPEND FINGERPRINT.',
+      "     One-way f(x_secret, x_pubkey) — deterministic.",
+      "     Same person signs twice → same fingerprint.",
+      "     Reveals NOTHING about who. Catches abuse only.",
+      "",
+      '  "content".c0 → THE CHALLENGE SEED.',
+      "     Where the verification loop starts.",
+      "",
+      '  "content".responses → 5 LOOKING-IDENTICAL NUMBERS.',
+      "     4 are pure random noise. 1 was crafted with a",
+      "     real secret key. Indistinguishable on the wire —",
+      "     that indistinguishability IS the anonymity.",
+      "",
+      '  "sig" → envelope signature of the EPHEMERAL publisher.',
+      "     NOT a ring member. Proves event integrity to the",
+      "     relay. Says nothing about who made the LSAG proof.",
+      "",
+      "VERIFY = walk the loop: c0 → hash → hash → ... → back",
+      "to c0? Closes ⟺ SOMEONE in the ring knew a secret key.",
+      "Closes equally for all 5 positions → which one: never.",
+    ]),
+  );
+
+
   // ── 3. Maker verifies the ring signature ─────────────────────
   section("3. Maker (cash withdrawer) verifies the proof", opts);
   explain(
@@ -493,13 +734,54 @@ export function main(
       "or invalid (outsider — walk away). Anonymity intact either way.",
   );
 
-  const { result: isValid, ms: verifyMs } = timed(() => verify(message, ring, sig));
+  // R3: REAL transport. The taker publishes the signed kind 30221 event
+  // to a Nostr relay; the maker receives it over the wire like a separate
+  // app would, then rebuilds ring + proof FROM THE EVENT — not local vars.
+  let verifyRing = ring;
+  let verifySig = sig;
+  let verifyMessage: Uint8Array = message;
+  let viaLine = "proof arrived via: offline (local variables)";
+  if (relayOn) {
+    try {
+      const session = await openRelaySession(relayPort());
+      try {
+        console.log(
+          `relay: ws://localhost:${session.port} — REAL Nostr transport` +
+            (session.external ? " (standalone relay detected)" : ""),
+        );
+        const echoedId = await relayPublish(session.url, event);
+        console.log(
+          `taker: EVENT accepted ['OK', id, true] — relay-echoed event id ${truncate(echoedId, 16)}`,
+        );
+        const wireEvent = await relayFetchProof(session.url, echoedId);
+        console.log("maker: REQ {kinds:[30221]} → proof received over the wire");
+        const fromWire = proofFromWireEvent(wireEvent);
+        console.log(
+          `maker: ring rebuilt from event tags (${fromWire.ring.length} pubkeys) — LSAG proof from event content`,
+        );
+        verifyRing = fromWire.ring;
+        verifySig = fromWire.sig;
+        verifyMessage = fromWire.message;
+        viaLine = `proof arrived via: REAL Nostr relay (event ${truncate(wireEvent.id, 12)})`;
+      } finally {
+        await session.close();
+      }
+    } catch {
+      // NEVER stall on stage: any transport failure → print-only path.
+      console.log("[!] relay unavailable, offline mode");
+    }
+  }
+
+  const { result: isValid, ms: verifyMs } = timed(() =>
+    verify(verifyMessage, verifyRing, verifySig)
+  );
 
   console.log(box("Verification result", [
     check("Signature is valid", isValid),
     check("Signer is in the ring (anonymous)", isValid),
     check("Signer identity hidden", true),
     "",
+    viaLine,
     `verified live in ${verifyMs} ms`,
     "",
     "The maker verified the taker belongs to the",
@@ -673,11 +955,9 @@ export function main(
 
 // Run when invoked directly via tsx
 if (process.argv[1] && import.meta.url.endsWith(process.argv[1].replace(/\\/g, "/"))) {
-  try {
-    // Pass raw argv so --npub values reach parseNpubArgs inside main().
-    main(process.argv.slice(2));
-  } catch (e) {
+  // Pass raw argv so --npub values and --offline reach the parsers in main().
+  main(process.argv.slice(2)).catch((e: unknown) => {
     console.error(`Error: ${e instanceof Error ? e.message : String(e)}`);
     process.exit(1);
-  }
+  });
 }

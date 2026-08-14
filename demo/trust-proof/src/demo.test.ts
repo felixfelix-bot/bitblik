@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
+import net from "node:net";
 import { bech32 } from "@scure/base";
 import { WebSocket } from "ws";
 import { secp256k1, schnorr } from "@noble/curves/secp256k1";
@@ -11,6 +12,7 @@ import { bytesToHex, hexToBytes } from "@noble/hashes/utils";
 import {
   main,
   parseArgs,
+  parseRelayMode,
   pause,
   decodeNpub,
   npubToRingPubkey,
@@ -53,13 +55,14 @@ function findOffCurveX32(): Uint8Array {
   throw new Error("no off-curve x found in 500 tries?!");
 }
 
-function captureMainOutput(argv: string[]): string {
+/** main() is async since R3 (relay transport) — every caller awaits it. */
+async function captureMainOutput(argv: string[]): Promise<string> {
   const logs: string[] = [];
   const spy = vi.spyOn(console, "log").mockImplementation((...a: unknown[]) => {
     logs.push(a.map(String).join(" "));
   });
   try {
-    main(argv);
+    await main(argv);
   } finally {
     spy.mockRestore();
   }
@@ -73,8 +76,8 @@ afterEach(() => {
 // ─── Existing demo smoke test ──────────────────────────────────
 
 describe("demo", () => {
-  it("opens with an ASCII roles diagram (who is who)", () => {
-    const out = captureMainOutput([]);
+  it("opens with an ASCII roles diagram (who is who)", async () => {
+    const out = await captureMainOutput([]);
     expect(out).toContain("0. The roles");
     expect(out).toContain("TAKER");
     expect(out).toContain("MAKER");
@@ -83,8 +86,8 @@ describe("demo", () => {
     expect(out.indexOf("0. The roles")).toBeLessThan(out.indexOf("1. Setup"));
   });
 
-  it("roles diagram flow: proof BEFORE sats, BLIK code LAST", () => {
-    const out = captureMainOutput([]);
+  it("roles diagram flow: proof BEFORE sats, BLIK code LAST", async () => {
+    const out = await captureMainOutput([]);
     const iProof = out.indexOf("2) ring signature proof");
     const iSats = out.indexOf("3) sats over Lightning");
     const iCode = out.indexOf("4) BLIK code");
@@ -95,8 +98,8 @@ describe("demo", () => {
     expect(iSats).toBeLessThan(iCode);
   });
 
-  it("ring members have human names", () => {
-    const out = captureMainOutput([]);
+  it("ring members have human names", async () => {
+    const out = await captureMainOutput([]);
     for (const n of ["Alice", "Bob", "Carol", "Dave", "Erin"]) {
       expect(out).toContain(n);
     }
@@ -104,21 +107,21 @@ describe("demo", () => {
     expect(out).toContain("secret key for Carol");
   });
 
-  it("prints the proof as a Nostr event with computed id", () => {
-    const out = captureMainOutput([]);
+  it("prints the proof as a Nostr event with computed id", async () => {
+    const out = await captureMainOutput([]);
     expect(out).toContain("Nostr event");
     expect(out).toMatch(/"kind": 30221/);
     expect(out).toMatch(/"id": "[0-9a-f]{64}"/);
     expect(out).toContain("npub1");
   });
 
-  it("shows live computation timing (ms) somewhere", () => {
-    const out = captureMainOutput([]);
+  it("shows live computation timing (ms) somewhere", async () => {
+    const out = await captureMainOutput([]);
     expect(out).toMatch(/\d+\.\d+ ms/);
   });
 
-  it("live tamper test inside section 3: valid then rejected", () => {
-    const out = captureMainOutput([]);
+  it("live tamper test inside section 3: valid then rejected", async () => {
+    const out = await captureMainOutput([]);
     const iValid = out.indexOf("Signature is valid");
     const iTamper = out.indexOf("Tamper test");
     const iS4 = out.indexOf("4. Nullifier");
@@ -128,15 +131,15 @@ describe("demo", () => {
     expect(out).toContain("REJECTED");
   });
 
-  it("explains THE PROBLEM before the roles", () => {
-    const out = captureMainOutput([]);
+  it("explains THE PROBLEM before the roles", async () => {
+    const out = await captureMainOutput([]);
     expect(out).toContain("The problem");
     expect(out).toContain("stolen card");
     expect(out.indexOf("The problem")).toBeLessThan(out.indexOf("0. The roles"));
   });
 
-  it("each step carries a 'why this step' explanation line", () => {
-    const out = captureMainOutput([]);
+  it("each step carries a 'why this step' explanation line", async () => {
+    const out = await captureMainOutput([]);
     const why = out.match(/>> /g)?.length ?? 0;
     expect(why).toBeGreaterThanOrEqual(5);
     expect(out).toContain("nobody can tell which");
@@ -144,10 +147,10 @@ describe("demo", () => {
     expect(out).toContain("same nullifier");
   });
 
-  it("main is a function and does not throw", () => {
+  it("main is an async function and resolves cleanly", async () => {
     expect(typeof main).toBe("function");
-    expect(() => main()).not.toThrow();
-  });
+    await expect(main()).resolves.toBeUndefined();
+  }, 30_000);
 });
 
 describe("flag parsing", () => {
@@ -197,17 +200,17 @@ describe("pause", () => {
 
 describe("demo output flags", () => {
   // waitForKey is always injected so interactive runs never touch real stdin.
-  function captureMainOutput(opts: {
+  async function captureMainOutput(opts: {
     interactive: boolean;
     quick: boolean;
-  }): string {
+  }): Promise<string> {
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
-    main({ ...opts, waitForKey: () => {} });
+    await main({ ...opts, waitForKey: () => {} });
     return log.mock.calls.map((args) => args.join(" ")).join("\n");
   }
 
-  it("no flags: full security check details shown, no pause prompt", () => {
-    const out = captureMainOutput({ interactive: false, quick: false });
+  it("no flags: full security check details shown, no pause prompt", async () => {
+    const out = await captureMainOutput({ interactive: false, quick: false });
     expect(out).toContain("5. Security checks");
     expect(out).toContain("5a. Wrong secret key");
     expect(out).toContain("5b. Tampered message");
@@ -215,35 +218,35 @@ describe("demo output flags", () => {
     expect(out).toContain("5d. Tampered key image");
     expect(out).not.toContain("[Enter] to continue...");
     expect(out).not.toContain("All 4 security checks passed");
-  });
+  }, 30_000);
 
-  it("--quick: security checks collapse to a single summary line", () => {
-    const out = captureMainOutput({ interactive: false, quick: true });
+  it("--quick: security checks collapse to a single summary line", async () => {
+    const out = await captureMainOutput({ interactive: false, quick: true });
     expect(out).toContain("All 4 security checks passed: ✅");
     expect(out).not.toContain("5a. Wrong secret key");
     expect(out).not.toContain("5b. Tampered message");
     expect(out).not.toContain("5c. Tampered response");
     expect(out).not.toContain("5d. Tampered key image");
-  });
+  }, 30_000);
 
-  it("--interactive: pause prompt after each of the 6 section headers", () => {
-    const out = captureMainOutput({ interactive: true, quick: false });
+  it("--interactive: pause prompt after each of the 6 section headers", async () => {
+    const out = await captureMainOutput({ interactive: true, quick: false });
     expect(out.match(/\[Enter\] to continue\.\.\./g)?.length).toBe(7);
-  });
+  }, 30_000);
 
-  it("--interactive: injected waitForKey is called once per section", () => {
+  it("--interactive: injected waitForKey is called once per section", async () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
     const waitForKey = vi.fn();
-    main({ interactive: true, quick: false, waitForKey });
+    await main({ interactive: true, quick: false, waitForKey });
     expect(waitForKey).toHaveBeenCalledTimes(7);
-  });
+  }, 30_000);
 
-  it("combined --interactive --quick works", () => {
-    const out = captureMainOutput({ interactive: true, quick: true });
+  it("combined --interactive --quick works", async () => {
+    const out = await captureMainOutput({ interactive: true, quick: true });
     expect(out).toContain("[Enter] to continue...");
     expect(out).toContain("All 4 security checks passed: ✅");
     expect(out).not.toContain("5a. Wrong secret key");
-  });
+  }, 30_000);
 });
 
 // ─── npub decoding ─────────────────────────────────────────────
@@ -360,17 +363,17 @@ describe("ring with participant decoys", () => {
     expect(Buffer.from(sig.keyImage).equals(Buffer.from(sigSmall.keyImage))).toBe(true);
   });
 
-  it("main output announces decoy count and grown ring size", () => {
-    const out = captureMainOutput(["--npub", npubA, npubB]);
+  it("main output announces decoy count and grown ring size", async () => {
+    const out = await captureMainOutput(["--npub", npubA, npubB]);
     expect(out).toContain("Participant npubs added as decoys: 2");
     expect(out).toContain("Ring size: 7");
-  });
+  }, 30_000);
 
-  it("without --npub the output is unchanged (no decoy section, ring of 5)", () => {
-    const out = captureMainOutput([]);
+  it("without --npub the output is unchanged (no decoy section, ring of 5)", async () => {
+    const out = await captureMainOutput([]);
     expect(out).not.toContain("Participant npubs");
     expect(out).toContain("Ring size: 5");
-  });
+  }, 30_000);
 });
 
 // ─── CLI end-to-end ────────────────────────────────────────────
@@ -472,11 +475,11 @@ describe("NIP-01 signed envelope (R2)", () => {
     expect(bytesToHex(a.secretKey)).not.toBe(bytesToHex(b.secretKey));
   });
 
-  it("demo narration: envelope schnorr-signed by EPHEMERAL publisher", () => {
-    const out = captureMainOutput([]);
+  it("demo narration: envelope schnorr-signed by EPHEMERAL publisher", async () => {
+    const out = await captureMainOutput([]);
     expect(out).toContain("EPHEMERAL publisher");
     expect(out).toContain("relay never learns which ring member signed");
-  });
+  }, 30_000);
 
   it("R1 relay accepts the signed event over a real socket: ['OK', id, true]", async () => {
     const { event } = build();
@@ -506,4 +509,124 @@ describe("NIP-01 signed envelope (R2)", () => {
       await relay.close();
     }
   }, 10_000);
+});
+
+// ─── R3: --relay mode (real WS transport, DEFAULT ON) ──────────
+
+describe("relay mode flag parsing (R3)", () => {
+  it("relay is DEFAULT ON: no flags → relay mode", () => {
+    expect(parseRelayMode([])).toBe(true);
+  });
+
+  it("--offline disables the relay transport", () => {
+    expect(parseRelayMode(["--offline"])).toBe(false);
+  });
+
+  it("--relay is explicit (same as the default)", () => {
+    expect(parseRelayMode(["--relay", "--quick"])).toBe(true);
+  });
+
+  it("--offline wins when both flags are given", () => {
+    expect(parseRelayMode(["--relay", "--offline"])).toBe(false);
+  });
+});
+
+describe("relay transport (R3, in-process)", () => {
+  it("default run: 'relay: ws://localhost:<port> — REAL Nostr transport' + relay-echoed id + all checks pass", async () => {
+    const out = await captureMainOutput([]);
+    expect(out).toMatch(/relay: ws:\/\/localhost:\d+ — REAL Nostr transport/);
+    expect(out).toContain("relay-echoed event id");
+    expect(out).toContain("ALL SECURITY CHECKS PASSED");
+    expect(out).not.toContain("[!] relay unavailable");
+  }, 30_000);
+
+  it("maker verifies the proof rebuilt FROM EVENT TAGS received over the wire", async () => {
+    const out = await captureMainOutput([]);
+    expect(out).toContain("REQ {kinds:[30221]}");
+    expect(out).toContain("over the wire");
+    expect(out).toContain("ring rebuilt from event tags");
+    expect(out).toContain("Signature is valid");
+  }, 30_000);
+
+  it("--offline: old print-only path — no relay lines, no fallback warning, demo completes", async () => {
+    const out = await captureMainOutput(["--offline"]);
+    expect(out).not.toContain("relay: ws://");
+    expect(out).not.toContain("[!] relay unavailable");
+    expect(out).toContain("0. The roles");
+    expect(out).toContain("Demo complete.");
+  }, 30_000);
+
+  it("forced bad port (TRUST_DEMO_RELAY_PORT): '[!] relay unavailable, offline mode' + demo completes", async () => {
+    // 65536 is outside the valid TCP port range → the bind fails fast and
+    // deterministically (never a privilege-dependent error).
+    process.env.TRUST_DEMO_RELAY_PORT = "65536";
+    try {
+      const out = await captureMainOutput([]);
+      expect(out).toContain("[!] relay unavailable, offline mode");
+      expect(out).not.toContain("relay: ws://localhost:");
+      expect(out).toContain("Demo complete.");
+    } finally {
+      delete process.env.TRUST_DEMO_RELAY_PORT;
+    }
+  }, 30_000);
+
+  it("port already held by a relay (EADDRINUSE) → demo connects to it externally", async () => {
+    // Hold an ephemeral port with OUR relay, point the demo at it via the
+    // env override, and check the demo treats it as a standalone relay.
+    const external = await startRelay({ port: 0 });
+    try {
+      process.env.TRUST_DEMO_RELAY_PORT = String(external.port);
+      const out = await captureMainOutput([]);
+      expect(out).toContain(`relay: ws://localhost:${external.port} — REAL Nostr transport`);
+      expect(out).toContain("relay-echoed event id");
+      expect(out).not.toContain("[!] relay unavailable");
+    } finally {
+      delete process.env.TRUST_DEMO_RELAY_PORT;
+      await external.close();
+    }
+  }, 30_000);
+
+  it("port squatted by a non-WS server → 3s deadline → offline fallback, never stalls", async () => {
+    const dumb = net.createServer(() => {
+      /* accept TCP connections but never speak the WS handshake */
+    });
+    await new Promise<void>((res) => dumb.listen(0, "127.0.0.1", res));
+    const squatPort = (dumb.address() as net.AddressInfo).port;
+    try {
+      process.env.TRUST_DEMO_RELAY_PORT = String(squatPort);
+      const t0 = Date.now();
+      const out = await captureMainOutput([]);
+      expect(out).toContain("[!] relay unavailable, offline mode");
+      expect(out).toContain("Demo complete.");
+      // bounded: the 3s WS deadline plus the demo itself — never a hang
+      expect(Date.now() - t0).toBeLessThan(15_000);
+    } finally {
+      delete process.env.TRUST_DEMO_RELAY_PORT;
+      dumb.close();
+    }
+  }, 60_000);
+});
+
+describe("CLI end-to-end (R3 relay mode)", () => {
+  it("default run (relay ON): exit 0 + 'relay:' line + relay-echoed id — REAL transport", () => {
+    const out = execFileSync(TSX_BIN, ["src/demo.ts", "--quick"], {
+      cwd: PKG_DIR,
+      encoding: "utf8",
+      timeout: 60_000,
+    });
+    expect(out).toMatch(/relay: ws:\/\/localhost:\d+ — REAL Nostr transport/);
+    expect(out).toContain("relay-echoed event id");
+    expect(out).not.toContain("[!] relay unavailable");
+  }, 90_000);
+
+  it("--offline run: exit 0, no relay lines, old print-only path", () => {
+    const out = execFileSync(TSX_BIN, ["src/demo.ts", "--offline", "--quick"], {
+      cwd: PKG_DIR,
+      encoding: "utf8",
+      timeout: 60_000,
+    });
+    expect(out).not.toContain("relay: ws://");
+    expect(out).not.toContain("[!] relay unavailable");
+    expect(out).toContain("Demo complete.");
+  }, 90_000);
 });
