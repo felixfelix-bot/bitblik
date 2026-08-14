@@ -76,6 +76,22 @@ describe("demo", () => {
     expect(out.indexOf("0. The roles")).toBeLessThan(out.indexOf("1. Setup"));
   });
 
+  it("explains THE PROBLEM before the roles", () => {
+    const out = captureMainOutput([]);
+    expect(out).toContain("The problem");
+    expect(out).toContain("stolen card");
+    expect(out.indexOf("The problem")).toBeLessThan(out.indexOf("0. The roles"));
+  });
+
+  it("each step carries a 'why this step' explanation line", () => {
+    const out = captureMainOutput([]);
+    const why = out.match(/>> /g)?.length ?? 0;
+    expect(why).toBeGreaterThanOrEqual(5);
+    expect(out).toContain("nobody can tell which");
+    expect(out).toContain("reveals nothing about which one");
+    expect(out).toContain("same nullifier");
+  });
+
   it("main is a function and does not throw", () => {
     expect(typeof main).toBe("function");
     expect(() => main()).not.toThrow();

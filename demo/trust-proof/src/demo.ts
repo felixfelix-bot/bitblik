@@ -73,6 +73,25 @@ function check(label: string, ok: boolean): string {
 
 // ─── Roles diagram (opening visual) ────────────────────────────
 
+function problemBox(): void {
+  console.log(
+    box("The problem — why this demo exists", [
+      "Someone sells you a BLIK code for sats. You withdraw cash",
+      "at an ATM. If the code was funded by a stolen card, YOU",
+      "look like the fraudster.",
+      "",
+      "The cash withdrawer needs proof the code seller is trusted",
+      "— WITHOUT unmasking them. Enter: ring signatures.",
+    ]),
+  );
+}
+
+function explain(text: string): void {
+  // Dim 'why this step' narration printed above each section's content.
+  for (const line of text.split("\n")) console.log(`>> ${line}`);
+  console.log();
+}
+
 function rolesDiagram(): void {
   const art = [
     "   TAKER  (BLIK code provider)       MAKER  (cash withdrawer)",
@@ -272,11 +291,17 @@ export function main(
   console.log("=".repeat(BOX_WIDTH));
 
   // ── 0. Opening visual: who is who ───────────────────────────
+  problemBox();
   section("0. The roles — who is who", opts);
   rolesDiagram();
 
   // ── 1. Setup: generate 5 keypairs (the ring of makers) ───────
   section("1. Setup — Generate 5 maker keypairs", opts);
+  explain(
+    "The ring = 5 public keys of trusted withdrawers (in the real\n" +
+      "app these come from the maker's Nostr kind 3 follow list).\n" +
+      "One of them is secretly our taker — nobody can tell which.",
+  );
 
   const RING_SIZE = 5;
   const keys = Array.from({ length: RING_SIZE }, () => generateKeyPair());
@@ -321,6 +346,11 @@ export function main(
 
   // ── 2. Taker generates ring signature ────────────────────────
   section("2. Taker generates ring signature", opts);
+  explain(
+    "The taker proves 'I hold ONE of the secret keys in this ring'.\n" +
+      "LSAG math reveals nothing about which one — the signature\n" +
+      "checks out for every ring member equally.",
+  );
 
   const message = enc.encode("I am a trusted code provider for bitblik");
   const sig: LSAGSignature = sign(message, ring, takerIndex, takerSecret);
@@ -334,6 +364,11 @@ export function main(
 
   // ── 3. Maker verifies the ring signature ─────────────────────
   section("3. Maker (cash withdrawer) verifies the proof", opts);
+  explain(
+    "The maker checks the proof against THEIR trust ring.\n" +
+      "Two outcomes: valid (a member signed — trade can proceed)\n" +
+      "or invalid (outsider — walk away). Anonymity intact either way.",
+  );
 
   const isValid = verify(message, ring, sig);
 
@@ -349,6 +384,11 @@ export function main(
 
   // ── 4. Nullifier reuse detection ─────────────────────────────
   section("4. Nullifier reuse detection (linkability)", opts);
+  explain(
+    "Every signature carries a nullifier — a fingerprint of the\n" +
+      "secret key. Same taker signs twice → same nullifier →\n" +
+      "double-use detected, still without identifying them.",
+  );
 
   // Same taker signs a different message — key image must be the same.
   const message2 = enc.encode("Second proof from the same taker");
@@ -385,6 +425,11 @@ export function main(
 
   // ── 5. Security checks ───────────────────────────────────────
   section("5. Security checks", opts);
+  explain(
+    "Break it every way an attacker would: wrong key, tampered\n" +
+      "message, tampered response, tampered nullifier.\n" +
+      "All must fail — anonymity never becomes a forgery tool.",
+  );
 
   // All four checks always run; only the printing depends on --quick.
   // 5a. Wrong secret key
