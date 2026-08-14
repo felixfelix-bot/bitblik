@@ -21,11 +21,15 @@
  *   maker  = cash withdrawer (member of the ring of trusted withdrawers)
  *   taker  = code provider (the one who proves membership via ring sig)
  *
- * Run:  npx tsx src/demo.ts [--interactive] [--quick]
+ * Run:  npx tsx src/demo.ts [--interactive] [--quick] [--npub npub1... [npub1... ...]]
  *
  * Flags:
  *   --interactive  pause after each section header ("[Enter] to continue...")
  *   --quick        collapse the security checks into one summary line
+ *   --npub         participant NOSTR pubkeys (npub1...) inserted into the
+ *                  ring as decoys BEFORE signing. The taker still signs
+ *                  with their own key; participants are anonymous ring
+ *                  members, not signers.
  */
 
 import {
@@ -36,6 +40,7 @@ import {
 } from "./lsag.js";
 import { secp256k1 } from "@noble/curves/secp256k1";
 import { readSync } from "node:fs";
+import { bech32 } from "@scure/base";
 
 // ─── ASCII helpers ──────────────────────────────────────────────
 
@@ -95,7 +100,10 @@ export interface PauseOptions {
   waitForKey?: () => void;
 }
 
-export interface MainOptions extends DemoOptions, PauseOptions {}
+export interface MainOptions extends DemoOptions, PauseOptions {
+  /** Participant npubs to insert into the ring as decoys (optional). */
+  npubs?: string[];
+}
 
 export function parseArgs(argv: string[]): DemoOptions {
   return {
@@ -125,10 +133,112 @@ export function pause(opts: PauseOptions): void {
   readEnterKey();
 }
 
+// ─── npub helpers (participant ring decoys) ────────────────────
+
+/**
+ * Decode a NOSTR npub (bech32) into its 32-byte x-only secp256k1 pubkey.
+ * Throws a clear "Invalid npub" error for anything malformed: bad bech32
+ * checksum, wrong prefix, wrong payload length.
+ */
+export function decodeNpub(npub: string): Uint8Array {
+  try {
+    const { prefix, bytes } = bech32.decodeToBytes(npub);
+    if (prefix !== "npub") {
+      throw new Error(`expected prefix "npub", got "${prefix}"`);
+    }
+    if (bytes.length !== 32) {
+      throw new Error(`expected 32-byte payload, got ${bytes.length} bytes`);
+    }
+    return bytes;
+  } catch (e) {
+    const reason = e instanceof Error ? e.message : String(e);
+    throw new Error(`Invalid npub "${truncate(npub, 24)}": ${reason}`);
+  }
+}
+
+/**
+ * Convert an npub into a 33-byte compressed secp256k1 public key usable as
+ * a ring member. The npub carries only the x coordinate, so we try both
+ * y parities (0x02 / 0x03); whichever yields a valid on-curve point wins.
+ * For anonymity it does not matter which parity is used — a decoy never
+ * signs, it only needs to be a valid point in the ring.
+ */
+export function npubToRingPubkey(npub: string): Uint8Array {
+  const x32 = decodeNpub(npub);
+  for (const parity of [0x02, 0x03] as const) {
+    const candidate = new Uint8Array(33);
+    candidate.set(x32, 1);
+    candidate[0] = parity;
+    try {
+      secp256k1.Point.fromBytes(candidate).assertValidity();
+      return candidate;
+    } catch {
+      // wrong parity — try the other one
+    }
+  }
+  throw new Error(
+    `Invalid npub "${truncate(npub, 24)}": x coordinate is not a point on secp256k1`,
+  );
+}
+
+/**
+ * Extract participant npub values from argv.
+ *   ["--npub", A, B]        → [A, B]
+ *   ["--quick", "--npub", A] → [A]        (flag can appear anywhere)
+ *   ["--npub", A, "--quick"] → [A]        (values stop at the next flag)
+ * Repeated --npub flags accumulate. "--npub" with no value throws.
+ */
+export function parseNpubArgs(argv: string[]): string[] {
+  const npubs: string[] = [];
+  let i = 0;
+  while (i < argv.length) {
+    const arg = argv[i];
+    if (arg !== "--npub") {
+      i++;
+      continue;
+    }
+    let count = 0;
+    i++;
+    while (i < argv.length) {
+      const v = argv[i];
+      if (v === undefined || v.startsWith("--")) break;
+      npubs.push(v);
+      count++;
+      i++;
+    }
+    if (count === 0) {
+      throw new Error(
+        "--npub requires at least one npub1... value, e.g. --npub npub1abc... npub1def...",
+      );
+    }
+  }
+  return npubs;
+}
+
 // ─── Demo ───────────────────────────────────────────────────────
 
-export function main(opts: MainOptions = parseArgs(process.argv.slice(2))): void {
+export function main(
+  optsIn: MainOptions | string[] = parseArgs(process.argv.slice(2)),
+): void {
   const enc = new TextEncoder();
+
+  // --npub support: main accepts either a raw argv array or an options
+  // object. Validate participant npubs BEFORE anything runs — an invalid
+  // npub must fail fast with a clear error, never a partial demo run.
+  let opts: MainOptions;
+  let npubs: string[];
+  let participantPks: Uint8Array[];
+  try {
+    opts = Array.isArray(optsIn)
+      ? { ...parseArgs(optsIn), npubs: parseNpubArgs(optsIn) }
+      : optsIn;
+    npubs = opts.npubs ?? [];
+    // Force full validation (bech32 + on-curve) of every npub up front.
+    participantPks = npubs.map(npubToRingPubkey);
+  } catch (e) {
+    console.error(`Error: ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(1);
+  }
 
   console.log();
   console.log("=".repeat(BOX_WIDTH));
@@ -141,15 +251,32 @@ export function main(opts: MainOptions = parseArgs(process.argv.slice(2))): void
 
   const RING_SIZE = 5;
   const keys = Array.from({ length: RING_SIZE }, () => generateKeyPair());
-  const ring = keys.map((k) => k.publicKey);
+  // Ring = generated maker keys + participant npub decoys, assembled
+  // BEFORE signing. The taker still signs with their own key below.
+  const ring = [...keys.map((k) => k.publicKey), ...participantPks];
 
   console.log(box("Ring of makers (public keys)", [
-    `Ring size: ${RING_SIZE}`,
+    `Ring size: ${ring.length}`,
+    ...(participantPks.length
+      ? [`Participant npubs added as decoys: ${participantPks.length}`]
+      : []),
     "",
     ...keys.map((k, i) =>
       info(`maker[${i}]`, truncate(hex(k.publicKey), 24))
     ),
   ]));
+
+  if (participantPks.length > 0) {
+    console.log(box("Participant npubs (ring decoys)", [
+      `Participant npubs added as decoys: ${participantPks.length}`,
+      "",
+      ...npubs.map((n, i) => info(`participant[${i}]`, truncate(n, 24))),
+      "",
+      "Each participant pubkey is now an anonymous",
+      "ring member. The taker still signs with their",
+      "own key — participants are decoys only.",
+    ]));
+  }
 
   // The taker is maker[2] — they will prove membership without revealing which.
   const takerIndex = 2;
@@ -323,5 +450,11 @@ export function main(opts: MainOptions = parseArgs(process.argv.slice(2))): void
 
 // Run when invoked directly via tsx
 if (process.argv[1] && import.meta.url.endsWith(process.argv[1].replace(/\\/g, "/"))) {
-  main();
+  try {
+    // Pass raw argv so --npub values reach parseNpubArgs inside main().
+    main(process.argv.slice(2));
+  } catch (e) {
+    console.error(`Error: ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(1);
+  }
 }
