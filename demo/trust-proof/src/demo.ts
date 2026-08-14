@@ -71,6 +71,31 @@ function check(label: string, ok: boolean): string {
   return `${ok ? "[+]" : "[-]"} ${label}`;
 }
 
+// ─── Roles diagram (opening visual) ────────────────────────────
+
+function rolesDiagram(): void {
+  const art = [
+    "   TAKER  (BLIK code provider)       MAKER  (cash withdrawer)",
+    "   ---------------------------       ------------------------",
+    "   has : BLIK code + secret key      has : trust ring (kind 3)",
+    "   wants: sats                       wants: proof of clean code",
+    "",
+    "      1) BLIK code",
+    "   TAKER ------------------->  MAKER",
+    "",
+    "      2) ring signature proof:",
+    "         \"I am ONE of the pubkeys",
+    "          in YOUR trust ring\"",
+    "   TAKER ------------------->  MAKER   (verifies: nobody learns which)",
+    "",
+    "      3) sats over Lightning",
+    "   TAKER <-------------------  MAKER",
+    "",
+    "   proof binds to THIS trade (offer_id + tx_id) — replay elsewhere fails",
+  ];
+  console.log(art.join("\n"));
+}
+
 function info(label: string, value: string): string {
   return `    ${label}: ${value}`;
 }
@@ -245,6 +270,10 @@ export function main(
   console.log("  bitblik Trust Proof Demo — LSAG Ring Signatures");
   console.log("  maker = cash withdrawer    taker = code provider");
   console.log("=".repeat(BOX_WIDTH));
+
+  // ── 0. Opening visual: who is who ───────────────────────────
+  section("0. The roles — who is who", opts);
+  rolesDiagram();
 
   // ── 1. Setup: generate 5 keypairs (the ring of makers) ───────
   section("1. Setup — Generate 5 maker keypairs", opts);

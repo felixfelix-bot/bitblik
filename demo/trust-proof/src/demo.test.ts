@@ -66,6 +66,16 @@ afterEach(() => {
 // ─── Existing demo smoke test ──────────────────────────────────
 
 describe("demo", () => {
+  it("opens with an ASCII roles diagram (who is who)", () => {
+    const out = captureMainOutput([]);
+    expect(out).toContain("0. The roles");
+    expect(out).toContain("TAKER");
+    expect(out).toContain("MAKER");
+    expect(out).toContain("trust ring");
+    expect(out).toContain("BLIK code");
+    expect(out.indexOf("0. The roles")).toBeLessThan(out.indexOf("1. Setup"));
+  });
+
   it("main is a function and does not throw", () => {
     expect(typeof main).toBe("function");
     expect(() => main()).not.toThrow();
@@ -150,14 +160,14 @@ describe("demo output flags", () => {
 
   it("--interactive: pause prompt after each of the 6 section headers", () => {
     const out = captureMainOutput({ interactive: true, quick: false });
-    expect(out.match(/\[Enter\] to continue\.\.\./g)?.length).toBe(6);
+    expect(out.match(/\[Enter\] to continue\.\.\./g)?.length).toBe(7);
   });
 
   it("--interactive: injected waitForKey is called once per section", () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
     const waitForKey = vi.fn();
     main({ interactive: true, quick: false, waitForKey });
-    expect(waitForKey).toHaveBeenCalledTimes(6);
+    expect(waitForKey).toHaveBeenCalledTimes(7);
   });
 
   it("combined --interactive --quick works", () => {
