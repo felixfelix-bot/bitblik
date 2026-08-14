@@ -16,12 +16,15 @@
  *   1. I = x_s * H(P_s)
  *   2. pick random r_s;  c_{s+1} = H(m, r_s*G, r_s*H(P_s))
  *   3. for i = s+1, s+2, ..., s-1 (wrapping mod n), i != s:
- *        pick random r_i;  c_{i+1} = H(m, c_i*G + r_i*P_i, c_i*H(P_i) + r_i*I)
+ *        pick random r_i;  c_{i+1} = H(m, r_i*G + c_i*P_i, r_i*H(P_i) + c_i*I)
  *   4. close the ring: set r_s = r_s_random - x_s * c_s  (mod n)
  *
  * Verify (message m, ring P_0..P_{n-1}, signature (I, c_0, r_0..r_{n-1})):
- *   for each i:  c_{i+1} = H(m, c_i*G + r_i*P_i, c_i*H(P_i) + r_i*I)
+ *   for each i:  c_{i+1} = H(m, r_i*G + c_i*P_i, r_i*H(P_i) + c_i*I)
  *   accept iff c_n == c_0  and I is a valid non-identity point.
+ *
+ * CRITICAL: r_i multiplies the generators (G, H(P_i)); c_i multiplies the
+ * public keys (P_i, I). Swapping these roles breaks ring closure.
  */
 
 import { secp256k1 } from "@noble/curves/secp256k1";
