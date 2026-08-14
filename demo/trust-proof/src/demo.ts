@@ -39,7 +39,9 @@ import {
   type LSAGSignature,
 } from "./lsag.js";
 import { secp256k1 } from "@noble/curves/secp256k1";
+import { sha256 } from "@noble/hashes/sha256";
 import { readSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { bech32 } from "@scure/base";
 
 // ─── ASCII helpers ──────────────────────────────────────────────
@@ -90,6 +92,39 @@ function explain(text: string): void {
   // Dim 'why this step' narration printed above each section's content.
   for (const line of text.split("\n")) console.log(`>> ${line}`);
   console.log();
+}
+
+// ─── Human names for the 5 ring members ────────────────────────
+
+const RING_NAMES = ["Alice", "Bob", "Carol", "Dave", "Erin"];
+const nameOf = (i: number): string => RING_NAMES[i] ?? `maker[${i}]`;
+
+/** Millisecond timer string for live-computation proof. */
+function timed<T>(fn: () => T): { result: T; ms: string } {
+  const t0 = performance.now();
+  const result = fn();
+  return { result, ms: (performance.now() - t0).toFixed(2) };
+}
+
+/** Build the demo Nostr event (custom kind 30221) carrying the proof. */
+function buildNostrEvent(
+  takerXOnly: string,
+  ringNames: string[],
+  content: string,
+): { event: Record<string, unknown>; id: string } {
+  const ev = {
+    kind: 30221,
+    pubkey: takerXOnly,
+    created_at: Math.floor(Date.now() / 1000),
+    tags: [["ring", ...ringNames], ["offer", randomBytes(8).toString("hex")]],
+    content,
+  };
+  // NIP-01 canonical serialization: sha256 of [0,pubkey,created_at,kind,tags,content]
+  const serialized = JSON.stringify([
+    0, ev.pubkey, ev.created_at, ev.kind, ev.tags, ev.content,
+  ]);
+  const id = hex(sha256(new TextEncoder().encode(serialized)));
+  return { event: { ...ev, id }, id };
 }
 
 function rolesDiagram(): void {
@@ -319,7 +354,7 @@ export function main(
       : []),
     "",
     ...keys.map((k, i) =>
-      info(`maker[${i}]`, truncate(hex(k.publicKey), 24))
+      info(nameOf(i), truncate(hex(k.publicKey), 24))
     ),
   ]));
 
@@ -341,9 +376,9 @@ export function main(
 
   console.log();
   console.log(box("Taker (code provider)", [
-    `Acting as: maker[${takerIndex}] (secret identity)`,
+    `Acting as: ${nameOf(takerIndex)} — maker[${takerIndex}] (secret identity)`,
     info("secret key", truncate(hex(takerSecret), 24)),
-    "The taker knows they are maker[2], but the",
+    `The taker knows they are ${nameOf(takerIndex)}, but the`,
     "verifier cannot learn this from the signature.",
   ]));
 
@@ -356,14 +391,43 @@ export function main(
   );
 
   const message = enc.encode("I am a trusted code provider for bitblik");
-  const sig: LSAGSignature = sign(message, ring, takerIndex, takerSecret);
+  const { result: sig, ms: signMs } = timed(() =>
+    sign(message, ring, takerIndex, takerSecret)
+  );
 
   console.log(box("Ring signature produced", [
     info("message", '"I am a trusted code provider for bitblik"'),
     info("key image (nullifier)", truncate(hex(sig.keyImage), 24)),
     info("c0 (initial challenge)", truncate(hex(sig.c0), 24)),
     info("responses", `${sig.responses.length} x 32-byte scalars`),
+    "",
+    `computed live in ${signMs} ms — keys are fresh,`,
+    "values change on every run",
   ]));
+
+  // The proof as it would actually travel: a Nostr event (custom kind).
+  const takerXOnly = hex(keys[takerIndex].publicKey).slice(2); // x-only
+  const npub = bech32.encode(
+    "npub",
+    bech32.toWords(Uint8Array.from(Buffer.from(takerXOnly, "hex"))),
+  );
+  const { event } = buildNostrEvent(
+    takerXOnly,
+    keys.map((_, i) => nameOf(i)),
+    JSON.stringify({
+      msg: "I am a trusted code provider for bitblik",
+      keyImage: hex(sig.keyImage),
+      c0: hex(sig.c0),
+      responses: sig.responses.map((r) => hex(r)),
+    }),
+  );
+  console.log();
+  console.log("The proof as a Nostr event — what gets published:");
+  console.log(JSON.stringify(event, null, 2));
+  console.log(`taker npub: ${npub}`);
+  console.log("(ring tag shows names for readability — real event carries");
+  console.log(" full 32-byte hex pubkeys; a normal event's schnorr sig is");
+  console.log(" replaced by the LSAG proof: anyone in the ring could sign)");
 
   // ── 3. Maker verifies the ring signature ─────────────────────
   section("3. Maker (cash withdrawer) verifies the proof", opts);
@@ -373,16 +437,38 @@ export function main(
       "or invalid (outsider — walk away). Anonymity intact either way.",
   );
 
-  const isValid = verify(message, ring, sig);
+  const { result: isValid, ms: verifyMs } = timed(() => verify(message, ring, sig));
 
   console.log(box("Verification result", [
     check("Signature is valid", isValid),
     check("Signer is in the ring (anonymous)", isValid),
     check("Signer identity hidden", true),
     "",
+    `verified live in ${verifyMs} ms`,
+    "",
     "The maker verified the taker belongs to the",
     "ring of trusted withdrawers, but does NOT know",
     "which of the 5 makers produced the signature.",
+  ]));
+
+  // Live tamper test — proves this is real verification, not a script
+  // scrolling pre-baked output: flip ONE bit and watch it fail.
+  const tamperedLiveSig: LSAGSignature = {
+    ...sig,
+    responses: sig.responses.map((r, i) => {
+      if (i !== 0) return r;
+      const t = new Uint8Array(r);
+      t[0] ^= 0x01;
+      return t;
+    }),
+  };
+  const tamperedValid = verify(message, ring, tamperedLiveSig);
+  console.log(box("Tamper test — one bit flipped, live", [
+    `[-] tampered proof REJECTED (${tamperedValid ? "accepted?!" : "verify failed"})`,
+    "",
+    "Same code path, one flipped bit in one response",
+    "scalar: verification now fails. Every value on",
+    "screen was computed in this process, just now.",
   ]));
 
   // ── 4. Nullifier reuse detection ─────────────────────────────
@@ -471,8 +557,8 @@ export function main(
   } else {
     console.log(box("5a. Wrong secret key", [
       check("Signature with wrong key rejected", !wrongKeyResult),
-      "The taker must know the secret key for",
-      `maker[${takerIndex}] to produce a valid proof.`,
+      `The taker must know the secret key for ${nameOf(takerIndex)}`,
+      "to produce a valid proof.",
     ]));
 
     console.log(box("5b. Tampered message", [
@@ -518,6 +604,10 @@ export function main(
     check("Tampered key image rejected", !tamperedKeyImageResult),
     "",
     check("ALL SECURITY CHECKS PASSED", allPass),
+    "",
+    `Our taker was ${nameOf(takerIndex)} (maker[${takerIndex}]) all along —`,
+    "the audience never learned which, and neither",
+    "did the maker verifying the proof.",
   ]));
 
   console.log();

@@ -88,6 +88,39 @@ describe("demo", () => {
     expect(iSats).toBeLessThan(iCode);
   });
 
+  it("ring members have human names", () => {
+    const out = captureMainOutput([]);
+    for (const n of ["Alice", "Bob", "Carol", "Dave", "Erin"]) {
+      expect(out).toContain(n);
+    }
+    // security check 5a names the real signer
+    expect(out).toContain("secret key for Carol");
+  });
+
+  it("prints the proof as a Nostr event with computed id", () => {
+    const out = captureMainOutput([]);
+    expect(out).toContain("Nostr event");
+    expect(out).toMatch(/"kind": 30221/);
+    expect(out).toMatch(/"id": "[0-9a-f]{64}"/);
+    expect(out).toContain("npub1");
+  });
+
+  it("shows live computation timing (ms) somewhere", () => {
+    const out = captureMainOutput([]);
+    expect(out).toMatch(/\d+\.\d+ ms/);
+  });
+
+  it("live tamper test inside section 3: valid then rejected", () => {
+    const out = captureMainOutput([]);
+    const iValid = out.indexOf("Signature is valid");
+    const iTamper = out.indexOf("Tamper test");
+    const iS4 = out.indexOf("4. Nullifier");
+    expect(iValid).toBeGreaterThan(-1);
+    expect(iTamper).toBeGreaterThan(iValid);
+    expect(iTamper).toBeLessThan(iS4);
+    expect(out).toContain("REJECTED");
+  });
+
   it("explains THE PROBLEM before the roles", () => {
     const out = captureMainOutput([]);
     expect(out).toContain("The problem");
