@@ -2,7 +2,7 @@
 
 > **"I am one of N trusted people" — without revealing who.**
 
-A TypeScript demo of Linkable Spontaneous Anonymous Group (LSAG) ring signatures on secp256k1, applied to BitBlik's P2P BLIK/Lightning exchange. The taker (code provider) proves membership in a coordinator's trusted set without disclosing their identity, and a key-image nullifier prevents proof reuse.
+A TypeScript demo of Linkable Spontaneous Anonymous Group (LSAG) ring signatures on secp256k1, applied to BitBlik's P2P BLIK/Lightning exchange. The taker (code provider) proves membership in the specific maker's trust ring — that maker's own Nostr kind 3 follow list — without disclosing their identity, and a key-image nullifier prevents proof reuse.
 
 ---
 
@@ -28,7 +28,7 @@ BitBlik is a peer-to-peer BLIK/Lightning exchange over Nostr. The flow is:
 2. **Maker** (cash withdrawer) reserves the offer and pays via BLIK code
 3. **Coordinator** settles atomically — reveals the hold invoice preimage
 
-**The risk**: The maker can be associated with fraud if the taker's BLIK code was funded with a stolen card. The maker needs assurance that the taker belongs to a trusted set — the coordinator's Nostr web-of-trust (follow list) — **without revealing which specific member** the taker is.
+**The risk**: The maker can be associated with fraud if the taker's BLIK code was funded with a stolen card. The maker needs assurance that the taker belongs to a trusted set — the maker's own Nostr web-of-trust (their kind 3 follow list, seeded from a published list and then self-curated) — **without revealing which specific member** the taker is.
 
 **Why not just check the follow list directly?** If the maker asks "are you pubkey X in the follow list?", the taker's identity is revealed. If the taker simply asserts "I'm in the list", there's no cryptographic proof. We need a mechanism that proves membership *and* preserves anonymity *and* prevents reuse.
 
@@ -61,33 +61,50 @@ BitBlik is a peer-to-peer BLIK/Lightning exchange over Nostr. The flow is:
 
 ### 3.1 The Cast
 
+There is no central gatekeeper. **Every maker curates their own trust ring**, and the taker proves membership in the ring of the specific maker they transact with:
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  COORDINATOR                                                │
-│  Publishes kind 3 (Contact List) with trusted pubkeys       │
-│  Each 'p' tag = one trusted member → this IS the ring       │
+│  EVERY MAKER IS THEIR OWN CURATOR                           │
+│  Each maker publishes a kind 3 (Contact List) of the        │
+│  pubkeys THEY trust. Each 'p' tag = one trusted member.     │
+│  That follow list IS the maker's personal trust ring.       │
 └─────────────────────────────────────────────────────────────┘
-        │ follow list (kind 3)
-        ↓
+
 ┌──────────────┐                          ┌──────────────┐
 │   TAKER      │ ── ring signature ──→    │   MAKER      │
 │ (code provider)                         │ (cash withdrawer)│
-│ has x_s     │                          │ verifies     │
-│ generates   │                          │ checks nullifier│
-│ proof       │                          │              │
+│ has x_s     │                          │ verifies vs  │
+│ proves      │                          │ OWN kind 3   │
+│ membership  │                          │ list +       │
+│ in THIS     │                          │ nullifier DB │
+│ maker's ring│                          │              │
 └──────────────┘                          └──────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│  TRUST SEED (optional) — e.g. a coordinator's kind 3        │
+│  A well-curated public list a new maker can COPY once to    │
+│  bootstrap their ring, then diverge by curating.            │
+│  Seed/curator, not gatekeeper.                              │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### 3.2 Setup Phase (One-Time)
+The seed source does not have to be the settlement coordinator — any public kind 3 worth copying works. The coordinator simply makes a convenient, well-known seed, nothing more.
 
-The coordinator maintains a Nostr identity and publishes a kind 3 (Contact List) event. Each `p` tag in the event contains the hex pubkey of a trusted member. This follow list IS the ring membership set — no custom event kind needed, it's standard NIP-02.
+### 3.2 Setup Phase (One-Time, Per Maker)
+
+Each maker (cash withdrawer) maintains a Nostr identity and publishes a kind 3 (Contact List) event. Each `p` tag in the event contains the hex pubkey of someone the maker trusts. That follow list IS the ring membership set for proofs made to this maker — no custom event kind needed, it's standard NIP-02.
+
+**Bootstrapping a new maker** is one action: copy a published seed list (e.g. the coordinator's kind 3) to seed your ring, then curate it — follow and unfollow — as you gain first-hand experience. The coordinator is a seed and a curator others can copy from, never a gatekeeper who decides who may transact. No single party dictates trust; this is the literal web-of-trust.
+
+A taker who wants to sell to a specific maker checks that maker's kind 3 list (public data on relays); if their own npub is in it, they can produce a membership proof for that ring on demand.
 
 ### 3.3 Proof Generation (Taker)
 
 **Inputs:**
 - `x_s` — taker's Nostr private key (32-byte scalar)
 - `P_s` — taker's Nostr npub (in the follow list)
-- Ring: `[P_0, P_1, ..., P_{N-1}]` — the coordinator's follow list pubkeys
+- Ring: `[P_0, P_1, ..., P_{N-1}]` — the pubkeys from the specific maker's kind 3 follow list (fetched from relays)
 - Message: `m = "bitblik/trust-proof/v1:{offer_id}:{tx_id}"`
 
 **Steps:**
@@ -133,12 +150,12 @@ The coordinator maintains a Nostr identity and publishes a kind 3 (Contact List)
 
 **Inputs:**
 - The proof from the taker (key image, ring pubkeys, c_0, responses, message)
-- The coordinator's kind 3 event (fetched from relays)
+- The maker's own kind 3 event (already known — it's their follow list)
 - Local nullifier database (for reuse check)
 
 **Steps:**
 
-1. **Verify ring matches follow list**: `proof.ring_pubkeys` must match the `p` tags from the coordinator's kind 3 event (or be a subset, if subset rings are allowed).
+1. **Verify ring matches follow list**: `proof.ring_pubkeys` must match the `p` tags from the maker's own kind 3 event (or be a subset, if subset rings are allowed).
 
 2. **Recompute the ring**:
    ```
@@ -155,7 +172,7 @@ The coordinator maintains a Nostr identity and publishes a kind 3 (Contact List)
    - If `I` is in the DB with a different `tx_id` → same signer detected (per-transaction policy: allowed for new transactions)
    - If `I` is not in the DB → store and accept
 
-5. **Result**: The maker knows the taker is in the coordinator's follow list, does NOT know which specific pubkey, and the key image prevents proof replay.
+5. **Result**: The maker knows the taker is in their own ring, does NOT know which specific pubkey, and the key image prevents proof replay.
 
 ### 3.5 The Verify Equation (Corrected)
 
@@ -248,6 +265,16 @@ npm run demo
 # or: npx tsx src/demo.ts
 ```
 
+### Demo Flags
+
+| Flag | Effect |
+|------|--------|
+| `--interactive` | Pause after each section header (`[Enter] to continue...`) — paces a live demo |
+| `--quick` | Collapse the four security checks into one summary line (`All 4 security checks passed: ✅`) |
+| `--npub npub1... [npub1... ...]` | Insert participant npubs into the ring as anonymous decoys before signing (repeatable flag) |
+
+Presenting this demo live? [PRESENTER.md](PRESENTER.md) has a 1-minute script keyed to the `--interactive` pauses and a Q&A cheat sheet.
+
 ### Run Tests
 
 ```bash
@@ -275,74 +302,146 @@ npx tsc --noEmit
 
 ## 5. Demo Output
 
-The demo runs through 5 phases with ASCII art output:
+The demo runs through 5 numbered sections plus a summary, with ASCII box output. With `--quick` the security checks collapse to one line; with `--interactive` it pauses after each section header (see [PRESENTER.md](PRESENTER.md) for a live-demo script). The demo's ring of five generated keys plays the role of the verifying maker's trust ring; the taker is the ring member at index 2.
 
 ```
-╔══════════════════════════════════════════════════════════╗
-║  BitBlik Ring Signature Trust Proof — LSAG Demo          ║
-║  "I am one of 5 trusted people" — without revealing who  ║
-╚══════════════════════════════════════════════════════════╝
+================================================================
+  bitblik Trust Proof Demo — LSAG Ring Signatures
+  maker = cash withdrawer    taker = code provider
+================================================================
 
-════════════════════════════════════════════════════════════
-  SETUP — Coordinator publishes follow list (kind 3)
-════════════════════════════════════════════════════════════
-  Coordinator npub: npub1abc...
-  Follow list (5 members):
-    [0] npub1aaa...  (decoy)
-    [1] npub1bbb...  (decoy)
-    [2] npub1ccc...  ← taker's key (but verifier doesn't know this)
-    [3] npub1ddd...  (decoy)
-    [4] npub1eee...  (decoy)
++==============================================================+
+|             1. Setup — Generate 5 maker keypairs             |
++==============================================================+
++--------------------------------------------------------------+
+| Ring of makers (public keys)                                 |
+|--------------------------------------------------------------|
+| Ring size: 5                                                 |
+|                                                              |
+|     maker[0]: 028bc88d9c8f18976dc5d312...                    |
+|     maker[1]: 020ba26fa10b8cd2d73821bc...                    |
+|     maker[2]: 0331228d26aa70929ed61820...                    |
+|     maker[3]: 030a12562c5b3f9c40de8c0f...                    |
+|     maker[4]: 03644270a5a0320726dce715...                    |
++--------------------------------------------------------------+
 
-════════════════════════════════════════════════════════════
-  STEP 1 — Taker generates ring signature
-════════════════════════════════════════════════════════════
-  Message: bitblik/trust-proof/v1:offer-001:tx-001
-  Key image (nullifier): 7a3f...
-  Ring size: 5
-  Signature: ✅ generated
++--------------------------------------------------------------+
+| Taker (code provider)                                        |
+|--------------------------------------------------------------|
+| Acting as: maker[2] (secret identity)                        |
+|     secret key: 106f2414930ffd384427b6fd...                  |
+| The taker knows they are maker[2], but the                   |
+| verifier cannot learn this from the signature.               |
++--------------------------------------------------------------+
 
-════════════════════════════════════════════════════════════
-  STEP 2 — Maker verifies ring signature
-════════════════════════════════════════════════════════════
-  Ring matches follow list: ✅
-  Signature valid: ✅
-  Key image not seen before: ✅
-  → ACCEPT: taker is one of 5 trusted members
++==============================================================+
+|              2. Taker generates ring signature               |
++==============================================================+
++--------------------------------------------------------------+
+| Ring signature produced                                      |
+|--------------------------------------------------------------|
+|     message: "I am a trusted code provider for bitblik"      |
+|     key image (nullifier): 02b902edd30e0da2e50aa887...       |
+|     c0 (initial challenge): dc72d14bd776ee60bf2ab133...      |
+|     responses: 5 x 32-byte scalars                           |
++--------------------------------------------------------------+
 
-════════════════════════════════════════════════════════════
-  STEP 3 — Nullifier check (reuse detection)
-════════════════════════════════════════════════════════════
-  Same taker, new transaction:
-  Key image: 7a3f... (SAME as before)
-  Message: bitblik/trust-proof/v1:offer-002:tx-002 (DIFFERENT)
-  → Same signer detected (key image match)
-  → New transaction allowed (per-transaction nullifier policy)
++==============================================================+
+|        3. Maker (cash withdrawer) verifies the proof         |
++==============================================================+
++--------------------------------------------------------------+
+| Verification result                                          |
+|--------------------------------------------------------------|
+| [+] Signature is valid                                       |
+| [+] Signer is in the ring (anonymous)                        |
+| [+] Signer identity hidden                                   |
+|                                                              |
+| The maker verified the taker belongs to the                  |
+| ring of trusted withdrawers, but does NOT know               |
+| which of the 5 makers produced the signature.                |
++--------------------------------------------------------------+
 
-════════════════════════════════════════════════════════════
-  STEP 4 — Security checks
-════════════════════════════════════════════════════════════
-  Wrong message → signature fails:           ✅ (correctly rejected)
-  Non-member key → signature fails:         ✅ (correctly rejected)
-  Tampered ring → signature fails:          ✅ (correctly rejected)
-  Tampered response → signature fails:      ✅ (correctly rejected)
++==============================================================+
+|          4. Nullifier reuse detection (linkability)          |
++==============================================================+
++--------------------------------------------------------------+
+| Same taker, two signatures                                   |
+|--------------------------------------------------------------|
+| [+] Sig 1 valid                                              |
+| [+] Sig 2 valid                                              |
+| [+] Key images match (same nullifier)                        |
+|                                                              |
+| The maker can link two proofs to the same taker              |
+| via the key image, even though the taker's                   |
+| identity remains anonymous.                                  |
++--------------------------------------------------------------+
++--------------------------------------------------------------+
+| Different taker, different nullifier                         |
+|--------------------------------------------------------------|
+| [+] Sig valid                                                |
+| [+] Key images differ (different nullifier)                  |
+|                                                              |
+| A different taker produces a different key                   |
+| image, so the maker can distinguish repeat                   |
+| takers from new ones.                                        |
++--------------------------------------------------------------+
+
++==============================================================+
+|                      5. Security checks                      |
++==============================================================+
+All 4 security checks passed: ✅
+
++==============================================================+
+|                           Summary                            |
++==============================================================+
++--------------------------------------------------------------+
+| All checks                                                   |
+|--------------------------------------------------------------|
+| [+] Valid signature verifies                                 |
+| [+] Linkability (same nullifier for same taker)              |
+| [+] Different takers have different nullifiers               |
+| [+] Wrong key rejected                                       |
+| [+] Tampered message rejected                                |
+| [+] Tampered response rejected                               |
+| [+] Tampered key image rejected                              |
+|                                                              |
+| [+] ALL SECURITY CHECKS PASSED                               |
++--------------------------------------------------------------+
+
+Demo complete.
 ```
+
+> Output abridged (key material truncated by the demo itself; hex values are
+> random per run). Without `--quick`, each of the four security checks prints
+> its own box. Note: the demo's on-screen labels (`maker[0..4]`, "ring of
+> trusted withdrawers") are legacy from the coordinator-only framing — read
+> them as "the pubkeys in the verifying maker's ring". With `--npub`,
+> participant npubs are inserted into the same ring as anonymous decoys before
+> signing; the proof still verifies.
 
 ---
 
 ## 6. Q&A Breadcrumbs
 
+**Q: Whose ring do I verify against?**
+
+The specific maker you are transacting with. Every maker (cash withdrawer) maintains their own kind 3 follow list — that list IS their personal trust ring, and it's the only ring that matters for a transaction with them. The taker generates the proof against that maker's ring; the maker verifies against their own list. Proofs do not transfer between makers: the ring differs per maker, and the signed message binds `offer_id` + `tx_id`, so replaying a proof at another transaction fails verification.
+
+**Q: How do I bootstrap a new maker's ring?**
+
+In one action: copy a published seed list (e.g. the coordinator's kind 3) to seed your own ring, then curate it — follow/unfollow — as you gain first-hand experience. The coordinator is a seed and curator others can copy from, not a gatekeeper. No single party dictates trust; this is the literal web-of-trust.
+
 **Q: How is this different from the blind signature trust demo?**
 
-The blind signature demo proves "the coordinator issued me a token" — it requires coordinator interaction at proof time and the coordinator can log proof generation requests. The ring signature demo proves "I am in the coordinator's follow list" — no coordinator interaction at proof time, stronger privacy. The key image is also a better nullifier: it's cryptographically bound to the signer's key, not just a hash of transaction data.
+The blind signature demo proves "the coordinator issued me a token" — it requires coordinator interaction at proof time and the coordinator can log proof generation requests. The ring signature demo proves "I am in the maker's own trust ring" — no coordinator interaction at proof time, stronger privacy. The key image is also a better nullifier: it's cryptographically bound to the signer's key, not just a hash of transaction data.
 
-**Q: What if the coordinator's follow list is small?**
+**Q: What if a maker's ring is small?**
 
-A small ring (10-50 members) means weak anonymity. In production, the coordinator can pad the ring with decoy pubkeys from the broader Nostr network. The trade-off: larger rings = more anonymity but slower signing/verification (O(N) for both). The demo uses 5 pubkeys — small enough to print, large enough to illustrate the concept.
+A small ring (10-50 members) means weak anonymity — the anonymity set is exactly the list size, and a tightly curated list narrows who the signer can be. Mitigation: pad the proof ring with decoy pubkeys from the broader Nostr network; the demo's `--npub` flag inserts participant npubs as decoys live. The trade-off: larger rings = more anonymity but slower signing/verification (O(N) for both). The demo uses 5 pubkeys — small enough to print, large enough to illustrate the concept.
 
-**Q: What if the follow list changes between proof generation and verification?**
+**Q: What if the maker's follow list changes between proof generation and verification?**
 
-The proof includes `follow_list_event_id` and `follow_list_created_at` from the kind 3 event. The maker fetches the specific event by ID, not just the latest kind 3. If the event is pruned by relays, the maker fetches the closest prior version. For the demo, the follow list is static.
+The proof includes `follow_list_event_id` and `follow_list_created_at` from the maker's kind 3 event. The maker verifies against that specific event by ID — their own list at the moment of the proof — not just whatever their latest kind 3 says. If the event is pruned by relays, the maker fetches the closest prior version. For the demo, the follow list is static.
 
 **Q: How does hash-to-curve work on secp256k1?**
 
@@ -404,7 +503,7 @@ The TypeScript demo is a reference implementation. For production in BitBlik (a 
 
 5. **Port the demo script**: Replace `console.log` with `print`. The ASCII art output is identical.
 
-6. **Integrate with BitBlik's Nostr layer**: Use the existing `core` package's NostrService to fetch the coordinator's kind 3 event. The ring pubkeys come from the `p` tags.
+6. **Integrate with BitBlik's Nostr layer**: Use the existing `core` package's NostrService to fetch the transacting maker's kind 3 event. The ring pubkeys come from the `p` tags.
 
 ### 7.3 File Structure (Dart)
 
@@ -425,8 +524,8 @@ packages/core/lib/src/trust_proof/
 
 ### 7.5 Production Considerations
 
-- **Ring padding**: In production, pad the ring with decoy pubkeys from popular Nostr relays to increase the anonymity set beyond the coordinator's follow list size.
-- **Multi-coordinator proofs**: The maker could require proofs from multiple coordinators (AND logic) for higher trust. Each coordinator has a different follow list.
+- **Ring padding**: In production, pad the ring with decoy pubkeys from popular Nostr relays to increase the anonymity set beyond the maker's own list size.
+- **Multi-ring proofs**: A maker could require proofs against several rings they respect (their own list plus one or more curator seed lists, AND logic) for higher trust. Each list is a different ring.
 - **Kind 38384 event**: For production, define a kind 38384 (Trust Proof) event — ephemeral, NIP-44 encrypted, direct taker→maker. The demo uses RPC params (simpler, coordinator-mediated).
 - **Nullifier DB**: In production, the nullifier database should be shared among makers (or maintained by the coordinator) to detect reuse across transactions. For the demo, it's local to the maker.
 
@@ -443,6 +542,8 @@ This demo uses X6's convention, which flips the original BitBlik terminology:
 
 > **Why the flip**: The cash withdrawer is the one "making" the withdrawal. The code provider is "taking" the offer. This convention puts the party at risk (the maker/cash withdrawer) in the verification role — they're the one who needs the trust proof.
 
+> **Whose ring is it anyway?** Every maker (cash withdrawer) maintains their own kind 3 follow list, and that list IS their personal trust ring. The taker proves membership in the specific maker's ring they transact with; the maker verifies against their own list. A coordinator's list is only a seed new makers can copy once and then diverge from — see [3.1 The Cast](#31-the-cast) and [3.2 Setup Phase](#32-setup-phase-one-time-per-maker).
+
 ### Cryptographic Terms
 
 | Term | Definition |
@@ -451,6 +552,8 @@ This demo uses X6's convention, which flips the original BitBlik terminology:
 | **LSAG** | Linkable Spontaneous Anonymous Group signature — the specific ring signature scheme used here |
 | **Key image** (aka linking tag) | `I = x_s · H(P_s)` — a curve point deterministically derived from the signer's private key. Serves as the nullifier. |
 | **Nullifier** | A value that prevents proof reuse. The key image IS the nullifier in LSAG. |
+| **Trust ring** | A specific maker's kind 3 follow list, used as the ring membership set for proofs made to that maker. Every counterparty curates their own. |
+| **Ring bootstrap** | Seeding a new maker's ring by copying a published kind 3 seed list in one action, then curating independently. |
 | **Ring closure** | The property that the hash chain `c_0 → c_1 → ... → c_{N-1} → c_0` closes back on itself. This is what makes the signature valid. |
 | **Hash-to-curve** | A function `H()` that maps arbitrary data to a point on the secp256k1 curve. Used to compute the key image. |
 | **Domain separator** | `"bitblik/trust-nullifier/v1"` — prevents cross-protocol replay of key images |
@@ -482,7 +585,7 @@ This demo uses X6's convention, which flips the original BitBlik terminology:
 
 ### Standards
 
-- **NIP-02** (Contact List): The kind 3 event that stores the coordinator's follow list. This IS the ring membership set.
+- **NIP-02** (Contact List): The kind 3 event that stores each account's follow list. In this design, every maker's kind 3 IS their personal trust ring; a coordinator's list is just a copyable seed.
 - **NIP-44** (Encryption): Used to encrypt trust proofs in the production kind 38384 event design.
 - **NIP-65** (Relay List): Used for relay discovery — the coordinator publishes its relay list as kind 10002.
 - **BIP-340** (Schnorr Signatures): The signing scheme used by Nostr. LSAG operates on the same curve (secp256k1) but uses its own signing logic.

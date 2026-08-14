@@ -4,6 +4,8 @@
 > **Status**: Design analysis for demo implementation  
 > **Scope**: Ring signature membership proofs for BitBlik P2P exchange  
 > **Terminology**: Per X6's request — "maker" = cash withdrawer (buys BLIK codes), "taker" = code provider (sells BLIK codes). This flips the original BitBlik convention so the cash withdrawer is the one "making" the withdrawal.
+>
+> **Design evolution**: the trust ring is no longer coordinator-only — every maker curates their own ring. See [§10 Design Evolution](#10-design-evolution-per-counterparty-trust-rings).
 
 ---
 
@@ -527,9 +529,54 @@ Follow the existing demo's style:
 |----------|---------------|----------|
 | Ring signature scheme | **LSAG** | secp256k1 native, linkable (key image = nullifier), spontaneous (no setup), simple enough for demo |
 | Blind signature integration | **Ring-only** | Simpler story, stronger privacy (no coordinator interaction at proof time), key image is better nullifier |
-| Trust set publication | **Coordinator's kind 3 (NIP-02)** | Already standard Nostr, no custom event needed for the trust set |
+| Trust set publication | **Each maker's own kind 3 (NIP-02)** | Per-counterparty rings: every maker curates their list; a coordinator's list is a copyable seed, not the trust set (see §10) |
 | Proof event kind | **38384** (for production) or **RPC param** (for demo) | Ephemeral, NIP-44 encrypted, direct taker→maker |
 | Nullifier | **LSAG key image** | Cryptographically bound to signer's key, deterministic, unlinkable to pubkey |
 | Domain separator | **"bitblik/trust-nullifier/v1"** | Used in hash-to-curve, prevents cross-protocol replay |
 | Nullifier policy | **Per-transaction** | Same taker can prove for multiple offers; same proof can't be replayed for same tx |
 | Demo ring size | **5 pubkeys** | Small enough to print, large enough to illustrate anonymity |
+
+---
+
+## 10. Design Evolution: Per-Counterparty Trust Rings
+
+Sections 1–9 analyzed a **coordinator-only** model: one coordinator's kind 3 follow list defines THE ring, and every proof is checked against it. The approved design change removes that single point of trust.
+
+### 10.1 What Changed
+
+| | Coordinator-only (original analysis) | Per-counterparty rings (current design) |
+|---|---|---|
+| Ring definition | The coordinator's kind 3 follow list | Each maker's own kind 3 follow list |
+| Who verifies | Maker, against the coordinator's list | Maker, against their OWN list |
+| Coordinator role | Gatekeeper — defines the trust set | Seed/curator — publishes a list others may copy |
+| Bootstrap | n/a — you trusted the coordinator or you didn't | New maker copies a seed list once, then curates |
+| Trust topology | Hub | Web (the literal web-of-trust) |
+
+- **Every counterparty** (each maker/cash withdrawer) maintains their own kind 3 follow list — their personal trust ring.
+- The **taker** (code provider) proves membership in the **specific maker's ring** they transact with; that maker verifies against their own list.
+- A **new maker bootstraps** by copying a coordinator's (or anyone's) published follow list in one action, then diverges by curating.
+- **No single party dictates trust.**
+
+### 10.2 Rationale
+
+1. **Decentralization / censorship resistance**: a coordinator-gatekeeper can be pressured, censor, or be compelled to unfollow people — and that one edit instantly changes who may transact *everywhere*. Per-counterparty rings remove the single decision-maker: excluding someone from one list never excludes them from the network.
+2. **Subjective trust, stored where it's used**: "trusted" is a claim by a specific verifier about specific peers. The new model keeps the trust data with the party at risk — the maker — instead of outsourcing judgement to a hub.
+3. **Bootstrap UX**: copying a seed list is one action. New makers start from a curated baseline without asking anyone's permission, then diverge as they gain first-hand experience.
+4. **Standard Nostr all the way down**: NIP-02 lists are already per-account and public; no new event kinds, no protocol additions.
+
+### 10.3 Trade-offs and Mitigations
+
+| Trade-off | Detail | Mitigation |
+|---|---|---|
+| Anonymity set = list size | Your anonymity in a proof is exactly the size of the verifying maker's ring. A tightly curated list of 10–20 pubkeys weakens anonymity — the signer is one of few plausible people. | **Ring padding with decoys**: pad the proof ring with pubkeys from the broader Nostr network (the demo's `--npub` flag inserts participant npubs as decoys live). Larger rings cost O(N) sign/verify — choose N accordingly. |
+| Fragmented verification data | With one coordinator list, everyone verified against the same event. Now every maker has their own list — and list versions. | The proof already carries `follow_list_event_id` / `follow_list_created_at`; verification pins the exact event **per maker**. |
+| Cross-maker proof replay | Could a proof accepted by maker A be replayed to maker B? | The signed message binds `offer_id` + `tx_id` (`bitblik/trust-proof/v1:{offer_id}:{tx_id}`), so a proof for one transaction fails for any other; and the ring itself is maker-specific, so ring-matching rejects it before the math even runs. |
+| Bootstrap herding | If everyone copies the same seed list and never edits it, the seed author's judgement is effectively re-centralized. | Curation is expected and cheap (follow/unfollow); the coordinator is framed as a starting point, not an authority. |
+
+### 10.4 What Stays the Same
+
+LSAG itself, the key-image nullifier, the domain separator
+(`bitblik/trust-nullifier/v1`), the per-transaction nullifier policy, the kind
+38384 proof event, and the Dart migration plan are unchanged — only the
+provenance of the ring (whose list it is) moved from the coordinator to each
+maker.
