@@ -541,12 +541,14 @@ describe("relay transport (R3, in-process)", () => {
     expect(out).not.toContain("[!] relay unavailable");
   }, 30_000);
 
-  it("maker verifies the proof rebuilt FROM EVENT TAGS received over the wire", async () => {
+  it("maker verifies against THEIR OWN trust ring — the event's ring tag is display-only", async () => {
     const out = await captureMainOutput([]);
     expect(out).toContain("REQ {kinds:[30221]}");
     expect(out).toContain("over the wire");
-    expect(out).toContain("ring rebuilt from event tags");
+    expect(out).toContain("DISPLAY-ONLY");
+    expect(out).toContain("MY OWN trust ring");
     expect(out).toContain("Signature is valid");
+    expect(out).not.toContain("ring rebuilt from event tags");
   }, 30_000);
 
   it("--offline: old print-only path — no relay lines, no fallback warning, demo completes", async () => {
@@ -759,6 +761,111 @@ describe("B2: canonical trade-binding message", () => {
     expect(Buffer.from(parsed.message).toString("hex")).toBe(
       Buffer.from(message).toString("hex"),
     );
-    expect(verify(parsed.message, parsed.ring, parsed.sig)).toBe(true);
+    expect(verify(parsed.message, ring, parsed.sig)).toBe(true);
   });
+});
+
+// ─── B1: caller-supplied ring, display-only ring tag ───────────
+
+describe("B1: verify uses the caller's ring — the event ring tag is display-only", () => {
+  const keys = Array.from({ length: 4 }, () => generateKeyPair());
+  const ring = keys.map((k) => k.publicKey);
+  const ringHex = ring.map((pk) => bytesToHex(pk));
+
+  async function demoExports() {
+    return (await import("./demo.js")) as unknown as Record<string, unknown>;
+  }
+
+  /** Build a genuine proof event over `ring` exactly the way the demo ships it. */
+  async function genuineEvent() {
+    const mod = await demoExports();
+    const buildBindingMessage = mod.buildBindingMessage as (b: {
+      amount: string;
+      makerNonce: string;
+      offerId: string;
+      ringHash: string;
+    }) => Uint8Array;
+    const ringHashFn = mod.ringHash as (r: Uint8Array[]) => string;
+    const binding = {
+      amount: "50000",
+      makerNonce: randomBytes(8).toString("hex"),
+      offerId: randomBytes(8).toString("hex"),
+      ringHash: ringHashFn(ring),
+    };
+    const message = buildBindingMessage(binding);
+    const sig = sign(message, ring, 1, keys[1].secretKey);
+    const { event } = buildNostrEvent(
+      generatePublisher(),
+      ringHex,
+      ["a", "b", "c", "d"],
+      binding.offerId,
+      JSON.stringify({
+        binding: {
+          amount: binding.amount,
+          maker_nonce: binding.makerNonce,
+          offer_id: binding.offerId,
+          ring_hash: binding.ringHash,
+          type: "bitblik.trust-proof",
+          v: 1,
+        },
+        keyImage: bytesToHex(sig.keyImage),
+        c0: bytesToHex(sig.c0),
+        responses: sig.responses.map((r) => bytesToHex(r)),
+      }),
+    );
+    return { event, message, sig };
+  }
+
+  it("proofFromWireEvent returns the tag ring only as displayRing — never as a verification input", async () => {
+    const { event } = await genuineEvent();
+    const parsed = proofFromWireEvent(event);
+    expect("ring" in parsed).toBe(false); // no verification ring handed back
+    const displayRing = (parsed as unknown as { displayRing?: unknown }).displayRing;
+    expect(Array.isArray(displayRing)).toBe(true);
+    expect((displayRing as Uint8Array[])).toHaveLength(4); // still shown to humans
+  });
+
+  it("verifyProofEvent(ev, ring): verifies with the CALLER's ring, ignores a lying ring tag", async () => {
+    const mod = await demoExports();
+    expect(typeof mod.verifyProofEvent).toBe("function");
+    const verifyProofEvent = mod.verifyProofEvent as (
+      ev: Parameters<typeof proofFromWireEvent>[0],
+      ring: Uint8Array[],
+    ) => boolean;
+
+    const { event } = await genuineEvent();
+    expect(verifyProofEvent(event, ring)).toBe(true);
+
+    // attacker re-orders the ring tag — display-only, verification unaffected
+    const lying: typeof event = {
+      ...event,
+      tags: event.tags.map((t) =>
+        t[0] === "ring" ? ["ring", ...t.slice(1).reverse()] : t,
+      ),
+    };
+    expect(verifyProofEvent(lying, ring)).toBe(true);
+
+    // attacker swaps in a completely different ring tag — still ignored
+    const fakeTag: typeof event = {
+      ...event,
+      tags: event.tags.map((t) =>
+        t[0] === "ring"
+          ? ["ring", "02" + "11".repeat(32), "02" + "22".repeat(32), "03" + "33".repeat(32), "02" + "44".repeat(32)]
+          : t,
+      ),
+    };
+    expect(verifyProofEvent(fakeTag, ring)).toBe(true);
+
+    // but the caller's ring IS what gets verified: a different ring rejects
+    const wrongRing = [ring[0], ring[1], generateKeyPair().publicKey, ring[3]];
+    expect(verifyProofEvent(event, wrongRing)).toBe(false);
+  });
+
+  it("demo narrates: maker verifies against MY OWN ring; ring tag is DISPLAY-ONLY", async () => {
+    const out = await captureMainOutput([]);
+    expect(out).toContain("DISPLAY-ONLY");
+    expect(out).toContain("MY OWN trust ring");
+    expect(out).toContain("ring tag tampered");
+    expect(out).not.toContain("ring rebuilt from event tags");
+  }, 30_000);
 });
