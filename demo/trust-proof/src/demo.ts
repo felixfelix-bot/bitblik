@@ -216,7 +216,7 @@ function rolesDiagram(): void {
     "      4) BLIK code delivered",
     "   TAKER ------------------->  MAKER",
     "",
-    "   proof binds to THIS trade (offer_id + tx_id) — replay elsewhere fails",
+    "   proof binds to THIS trade (amount+nonce+offer_id+ring) — replay fails",
   ];
   console.log(art.join("\n"));
 }
@@ -233,6 +233,68 @@ function hex(bytes: Uint8Array): string {
   return Array.from(bytes)
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
+}
+
+// ─── B2: canonical trade binding ───────────────────────────────
+
+/** The trade terms a proof is bound to — this IS the signed message. */
+export interface TradeBinding {
+  /** Trade amount in satoshis, decimal string (e.g. \"50000\"). */
+  amount: string;
+  /** Fresh 16-hex-char nonce — regenerated for every proof. */
+  makerNonce: string;
+  /** Offer id, 16 hex chars. */
+  offerId: string;
+  /** sha256 (64 hex) over the ordered concat of the ring's pubkeys. */
+  ringHash: string;
+}
+
+/**
+ * Binding hash of a verification ring: sha256 over the ordered concat of
+ * the ring's (compressed) pubkeys. Order matters — the ring sequence is
+ * part of what gets signed (B6), so this hash pins it.
+ */
+export function ringHash(ring: Uint8Array[]): string {
+  const flat = new Uint8Array(ring.reduce((n, pk) => n + pk.length, 0));
+  let off = 0;
+  for (const pk of ring) {
+    flat.set(pk, off);
+    off += pk.length;
+  }
+  return bytesToHex(sha256(flat));
+}
+
+/**
+ * The LSAG-signed message (B2): sha256 over the canonical JSON encoding
+ * of the binding object. The object literal is built with keys in
+ * lexicographic order and JSON.stringify emits no whitespace, so the
+ * encoding is canonical:
+ *   {\"amount\":\"…\",\"maker_nonce\":\"…\",\"offer_id\":\"…\",\"ring_hash\":\"…\",\"type\":\"bitblik.trust-proof\",\"v\":1}
+ * UTF-8 bytes → sha256 → the 32-byte message handed to sign().
+ * There is deliberately NO tx_id — on-chain binding is a Phase-2 concept.
+ */
+export function buildBindingMessage(binding: TradeBinding): Uint8Array {
+  const canonical = JSON.stringify({
+    amount: binding.amount,
+    maker_nonce: binding.makerNonce,
+    offer_id: binding.offerId,
+    ring_hash: binding.ringHash,
+    type: "bitblik.trust-proof",
+    v: 1,
+  });
+  return sha256(new TextEncoder().encode(canonical));
+}
+
+/** The binding as it travels inside the proof event's content (B2 wire shape). */
+export function bindingToJson(binding: TradeBinding): string {
+  return JSON.stringify({
+    amount: binding.amount,
+    maker_nonce: binding.makerNonce,
+    offer_id: binding.offerId,
+    ring_hash: binding.ringHash,
+    type: "bitblik.trust-proof",
+    v: 1,
+  });
 }
 
 // ─── CLI flags ─────────────────────────────────────────────────
@@ -529,23 +591,52 @@ async function relayFetchProof(url: string, expectedId: string): Promise<NostrEv
 
 /**
  * Rebuild the verification inputs strictly from what crossed the wire:
- * ring pubkeys from the `ring` tag, the LSAG proof from event content.
- * Nothing from the taker's local variables.
+ * the LSAG proof and trade binding from event content. The signed message
+ * is re-derived from the carried binding via the same canonical encoding
+ * the taker used (B2). Nothing from the taker's local variables.
  *
  * Exported since R4: `npm run preflight` runs the same maker-side rebuild.
  */
 export function proofFromWireEvent(
   ev: NostrEvent,
-): { ring: Uint8Array[]; sig: LSAGSignature; message: Uint8Array } {
+): { ring: Uint8Array[]; sig: LSAGSignature; message: Uint8Array; binding: TradeBinding } {
   const ringTag = ev.tags.find((t) => t[0] === "ring");
   if (ringTag === undefined || ringTag.length < 2) {
     throw new Error("wire event carries no ring tag");
   }
   const body = JSON.parse(ev.content) as {
-    msg: string;
-    keyImage: string;
-    c0: string;
-    responses: string[];
+    binding?: {
+      amount?: unknown;
+      maker_nonce?: unknown;
+      offer_id?: unknown;
+      ring_hash?: unknown;
+    };
+    keyImage?: string;
+    c0?: string;
+    responses?: string[];
+  };
+  const b = body?.binding;
+  if (
+    b === undefined ||
+    typeof b.amount !== "string" ||
+    typeof b.maker_nonce !== "string" ||
+    typeof b.offer_id !== "string" ||
+    typeof b.ring_hash !== "string"
+  ) {
+    throw new Error("wire event carries no trade binding");
+  }
+  if (
+    typeof body.keyImage !== "string" ||
+    typeof body.c0 !== "string" ||
+    !Array.isArray(body.responses)
+  ) {
+    throw new Error("wire event carries an incomplete LSAG proof");
+  }
+  const binding: TradeBinding = {
+    amount: b.amount,
+    makerNonce: b.maker_nonce,
+    offerId: b.offer_id,
+    ringHash: b.ring_hash,
   };
   return {
     ring: ringTag.slice(1).map((pk) => hexToBytes(pk)),
@@ -554,7 +645,8 @@ export function proofFromWireEvent(
       c0: hexToBytes(body.c0),
       responses: body.responses.map((r) => hexToBytes(r)),
     },
-    message: new TextEncoder().encode(body.msg),
+    binding,
+    message: buildBindingMessage(binding),
   };
 }
 
@@ -658,13 +750,28 @@ export async function main(
       "checks out for every ring member equally.",
   );
 
-  const message = enc.encode("I am a trusted code provider for bitblik");
+  // B2: the signed message is the sha256 of the canonical trade-binding
+  // object — amount + fresh maker_nonce + offer_id + ring_hash. No tx_id
+  // (Phase-2 concept): the proof binds to the trade terms, not a chain tx.
+  const amountSats = "50000";
+  const makerNonce = randomBytes(8).toString("hex"); // 16 hex, fresh per proof
+  const offerId = randomBytes(8).toString("hex"); // 16 hex
+  const binding: TradeBinding = {
+    amount: amountSats,
+    makerNonce,
+    offerId,
+    ringHash: ringHash(ring),
+  };
+  const message = buildBindingMessage(binding);
   const { result: sig, ms: signMs } = timed(() =>
     sign(message, ring, takerIndex, takerSecret)
   );
 
   console.log(box("Ring signature produced", [
-    info("message", '"I am a trusted code provider for bitblik"'),
+    info("binding", `${amountSats} sats, offer ${offerId}`),
+    info("maker_nonce (fresh)", makerNonce),
+    info("ring_hash", truncate(binding.ringHash, 24)),
+    info("message", `sha256(canonical binding JSON) = ${truncate(hex(message), 24)}`),
     info("key image (nullifier)", truncate(hex(sig.keyImage), 24)),
     info("c0 (initial challenge)", truncate(hex(sig.c0), 24)),
     info("responses", `${sig.responses.length} x 32-byte scalars`),
@@ -681,14 +788,13 @@ export async function main(
     "npub",
     bech32.toWords(Uint8Array.from(Buffer.from(publisher.pubkey, "hex"))),
   );
-  const offerId = randomBytes(8).toString("hex");
   const { event } = buildNostrEvent(
     publisher,
     ring.map((pk) => hex(pk)),
     keys.map((_, i) => nameOf(i)),
     offerId,
     JSON.stringify({
-      msg: "I am a trusted code provider for bitblik",
+      binding: JSON.parse(bindingToJson(binding)),
       keyImage: hex(sig.keyImage),
       c0: hex(sig.c0),
       responses: sig.responses.map((r) => hex(r)),
@@ -834,7 +940,10 @@ export async function main(
   );
 
   // Same taker signs a different message — key image must be the same.
-  const message2 = enc.encode("Second proof from the same taker");
+  // B2: a second proof gets a FRESH maker_nonce, so the canonical binding
+  // (and thus the signed message) differs while the signer does not.
+  const binding2: TradeBinding = { ...binding, makerNonce: randomBytes(8).toString("hex") };
+  const message2 = buildBindingMessage(binding2);
   const sig2 = sign(message2, ring, takerIndex, takerSecret);
 
   const sameKeyImage =
@@ -880,8 +989,8 @@ export async function main(
   const sigWrong = sign(message, ring, takerIndex, wrongKey.secretKey);
   const wrongKeyResult = verify(message, ring, sigWrong);
 
-  // 5b. Tampered message
-  const tamperedMsg = enc.encode("I am NOT a trusted provider");
+  // 5b. Tampered message (B2: tampered trade terms — the amount is signed)
+  const tamperedMsg = buildBindingMessage({ ...binding, amount: "50001" });
   const tamperedMsgResult = verify(tamperedMsg, ring, sig);
 
   // 5c. Tampered response

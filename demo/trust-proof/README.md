@@ -105,7 +105,9 @@ A taker who wants to sell to a specific maker checks that maker's kind 3 list (p
 - `x_s` — taker's Nostr private key (32-byte scalar)
 - `P_s` — taker's Nostr npub (in the follow list)
 - Ring: `[P_0, P_1, ..., P_{N-1}]` — the pubkeys from the specific maker's kind 3 follow list (fetched from relays)
-- Message: `m = "bitblik/trust-proof/v1:{offer_id}:{tx_id}"`
+- Message (B2): `m = sha256(canonical_json(binding))` where the binding object is
+  `{"amount":"<sats decimal>","maker_nonce":"<16 hex, fresh per proof>","offer_id":"<16 hex>","ring_hash":"<sha256 over the ordered concat of ring pubkeys, 64 hex>","type":"bitblik.trust-proof","v":1}`
+  — object literal built with keys in lexicographic order, `JSON.stringify` (no whitespace), UTF-8 → sha256. There is deliberately no `tx_id`: on-chain binding is a Phase-2 concept, so the proof binds to the trade terms, not a chain transaction.
 
 **Steps:**
 
@@ -171,8 +173,8 @@ A taker who wants to sell to a specific maker checks that maker's kind 3 list (p
 3. **Check closure**: `c_0' == c_0`. If the ring closes, the signature is valid.
 
 4. **Check nullifier (key image)**:
-   - If `I` is in the local nullifier DB with the same `tx_id` → already verified (idempotent OK)
-   - If `I` is in the DB with a different `tx_id` → same signer detected (per-transaction policy: allowed for new transactions)
+   - If `I` is in the local nullifier DB with the same `offer_id` → already verified (idempotent OK)
+   - If `I` is in the DB with a different `offer_id` → same signer detected (per-offer policy: allowed for new offers)
    - If `I` is not in the DB → store and accept
 
 5. **Result**: The maker knows the taker is in their own ring, does NOT know which specific pubkey, and the key image prevents proof replay.
@@ -245,7 +247,7 @@ The LSAG key image `I = x_s · H(P_s)` IS the nullifier:
 
 **Domain separator**: `"bitblik/trust-nullifier/v1"` — used in the hash-to-curve function to ensure the key image is specific to BitBlik and cannot be replayed from another protocol's ring signatures.
 
-**Nullifier policy (demo)**: Per-transaction. The key image is stored with the `tx_id`. Same key image + same `tx_id` = replay (rejected). Same key image + different `tx_id` = new transaction (accepted). This allows the same taker to prove membership for multiple offers while preventing replay of the same proof.
+**Nullifier policy (demo)**: Per-offer. The key image is stored with the `offer_id`. Same key image + same `offer_id` = replay (rejected). Same key image + different `offer_id` = new trade (accepted — the fresh `maker_nonce` in the binding makes every proof's message distinct anyway). This allows the same taker to prove membership for multiple offers while preventing replay of the same proof. `tx_id` binding is deferred to Phase 2.
 
 ---
 
@@ -410,8 +412,11 @@ The demo runs through 5 numbered sections plus a summary, with ASCII box output.
 +--------------------------------------------------------------+
 | Ring signature produced                                      |
 |--------------------------------------------------------------|
-|     message: "I am a trusted code provider for bitblik"      |
-|     key image (nullifier): 02b902edd30e0da2e50aa887...       |
+|     binding: 50000 sats, offer 9f4c…  (B2: the signed message   |
+|              IS sha256 of this canonical binding JSON)          |
+|     maker_nonce (fresh): a1b2c3d4e5f60718                     |
+|     ring_hash: 3f9d0e… (sha256 of ordered ring concat)          |
+|     key image (nullifier): 02b902edd30e0da2e50aa887...        |
 |     c0 (initial challenge): dc72d14bd776ee60bf2ab133...      |
 |     responses: 5 x 32-byte scalars                           |
 +--------------------------------------------------------------+
@@ -495,7 +500,7 @@ Demo complete.
 
 **Q: Whose ring do I verify against?**
 
-The specific maker you are transacting with. Every maker (cash withdrawer) maintains their own kind 3 follow list — that list IS their personal trust ring, and it's the only ring that matters for a transaction with them. The taker generates the proof against that maker's ring; the maker verifies against their own list. Proofs do not transfer between makers: the ring differs per maker, and the signed message binds `offer_id` + `tx_id`, so replaying a proof at another transaction fails verification.
+The specific maker you are transacting with. Every maker (cash withdrawer) maintains their own kind 3 follow list — that list IS their personal trust ring, and it's the only ring that matters for a transaction with them. The taker generates the proof against that maker's ring; the maker verifies against their own list. Proofs do not transfer between makers: the ring differs per maker, and the signed message binds `amount` + `maker_nonce` + `offer_id` + `ring_hash`, so replaying a proof at another trade fails verification.
 
 **Q: How do I bootstrap a new maker's ring?**
 
@@ -523,7 +528,7 @@ No. LSAG operates on curve points and scalars, not on the signing scheme. The ta
 
 **Q: Can the same taker prove membership for multiple transactions?**
 
-Yes — with per-transaction nullifier policy. The key image is constant per signer (it doesn't depend on the message), so the same taker will always produce the same key image. The maker checks: same key image + same `tx_id` = replay (rejected); same key image + different `tx_id` = new transaction (accepted). The message `m` changes per transaction, so the signature itself is different even though the key image is the same.
+Yes — with per-offer nullifier policy. The key image is constant per signer (it doesn't depend on the message), so the same taker will always produce the same key image. The maker checks: same key image + same `offer_id` = replay (rejected); same key image + different `offer_id` = new trade (accepted). The message `m` changes per proof (fresh `maker_nonce`), so the signature itself is different even though the key image is the same. `tx_id` binding is deferred to Phase 2.
 
 **Q: Why not combine blind signatures with ring signatures?**
 

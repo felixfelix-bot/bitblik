@@ -9,6 +9,7 @@ import { WebSocket } from "ws";
 import { runPreflight } from "./preflight.js";
 import { generatePublisher, buildNostrEvent } from "./demo.js";
 import { generateKeyPair, sign } from "./lsag.js";
+import { sha256 } from "@noble/hashes/sha256";
 
 // ─── Helpers ───────────────────────────────────────────────────
 
@@ -210,20 +211,31 @@ describe("standalone relay (npm run relay)", () => {
         ws.on("error", (e: Error) => { clearTimeout(timer); reject(e); });
         ws.on("open", () => {
           const keys = [generateKeyPair(), generateKeyPair(), generateKeyPair()];
+          const ring = keys.map((k) => k.publicKey);
+          const flat = new Uint8Array(33 * ring.length);
+          ring.forEach((pk, i) => flat.set(pk, i * 33));
           const lsagSig = sign(
             new TextEncoder().encode("preflight"),
-            keys.map((k) => k.publicKey),
+            ring,
             0,
             keys[0].secretKey,
           );
           const hex = (b: Uint8Array) => Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join("");
           const { event } = buildNostrEvent(
             generatePublisher(),
-            keys.map((k) => hex(k.publicKey)),
+            ring.map((k) => hex(k)),
             ["a", "b", "c"],
             "d-tag",
             JSON.stringify({
-              msg: "preflight",
+              // B2 wire shape: the canonical trade binding travels in content
+              binding: {
+                amount: "21000",
+                maker_nonce: "0".repeat(16),
+                offer_id: "d-tag-0000000000".slice(0, 16),
+                ring_hash: hex(sha256(flat)),
+                type: "bitblik.trust-proof",
+                v: 1,
+              },
               keyImage: hex(lsagSig.keyImage),
               c0: hex(lsagSig.c0),
               responses: lsagSig.responses.map(hex),

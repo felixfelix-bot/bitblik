@@ -26,7 +26,15 @@ import { bytesToHex, hexToBytes } from "@noble/hashes/utils";
 import { randomBytes } from "node:crypto";
 import { startRelay, eventId, type NostrEvent } from "./relay.js";
 import { generateKeyPair, sign, verify } from "./lsag.js";
-import { generatePublisher, buildNostrEvent, proofFromWireEvent } from "./demo.js";
+import {
+  generatePublisher,
+  buildNostrEvent,
+  proofFromWireEvent,
+  buildBindingMessage,
+  bindingToJson,
+  ringHash,
+  type TradeBinding,
+} from "./demo.js";
 
 /** Per-step deadline — every await is bounded so preflight can never hang. */
 const STEP_DEADLINE_MS = 2_000;
@@ -127,11 +135,16 @@ export async function runPreflight(): Promise<PreflightResult> {
   const t0 = performance.now();
 
   // 1. The demo's core crypto: a real LSAG proof over a 3-key ring.
+  //    B2: the signed message is the canonical trade-binding digest.
   const keys = [generateKeyPair(), generateKeyPair(), generateKeyPair()];
   const ring = keys.map((k) => k.publicKey);
-  const message = new TextEncoder().encode(
-    "preflight: I am a trusted code provider for bitblik",
-  );
+  const binding: TradeBinding = {
+    amount: "21000",
+    makerNonce: randomBytes(8).toString("hex"),
+    offerId: randomBytes(8).toString("hex"),
+    ringHash: ringHash(ring),
+  };
+  const message = buildBindingMessage(binding);
   const lsagSig = sign(message, ring, 1, keys[1].secretKey);
   if (!verify(message, ring, lsagSig)) {
     throw new Error("lsag: freshly signed proof does not verify (local)");
@@ -143,9 +156,9 @@ export async function runPreflight(): Promise<PreflightResult> {
     publisher,
     ring.map((pk) => bytesToHex(pk)),
     ["pf-a", "pf-b", "pf-c"],
-    randomBytes(8).toString("hex"),
+    binding.offerId,
     JSON.stringify({
-      msg: "preflight: I am a trusted code provider for bitblik",
+      binding: JSON.parse(bindingToJson(binding)),
       keyImage: bytesToHex(lsagSig.keyImage),
       c0: bytesToHex(lsagSig.c0),
       responses: lsagSig.responses.map((r) => bytesToHex(r)),
