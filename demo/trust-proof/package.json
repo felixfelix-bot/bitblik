@@ -10,7 +10,8 @@
     "test:watch": "vitest",
     "demo": "tsx src/demo.ts",
     "relay": "tsx src/relay-standalone.ts",
-    "preflight": "tsx src/preflight.ts"
+    "preflight": "tsx src/preflight.ts",
+    "test:cov": "vitest run --coverage"
   },
   "dependencies": {
     "@noble/curves": "^1.6.0",
