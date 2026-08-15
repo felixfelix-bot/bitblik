@@ -20,8 +20,12 @@
  *   2. Taker (one of the makers, acting as code provider) signs a message.
  *   3. Taker PUBLISHES the signed kind 30221 event to a real Nostr relay;
  *      the maker receives it OVER THE WIRE and verifies (--offline skips).
- *   4. Nullifier reuse detection — same taker signs twice, key image matches.
- *   5. Security checks — wrong key, tampered message, tampered response.
+ *   4. Key-image blocklist gate (T2) — BEFORE any sats move, the maker
+ *      checks the proof's key image against a PERSISTED deny list of
+ *      nullifiers from past disputed trades; a known-bad nullifier
+ *      WITHHOLDS the payment with an explicit message.
+ *   5. Nullifier reuse detection — same taker signs twice, key image matches.
+ *   6. Security checks — wrong key, tampered message, tampered response.
  *
  * Terminology:
  *   maker  = cash withdrawer (member of the ring of trusted withdrawers)
@@ -49,6 +53,9 @@
  * Environment:
  *   TRUST_DEMO_RELAY_PORT  relay port override (default 10547) — used by
  *                          tests and by a second demo run beside the first.
+ *   TRUST_DEMO_BLOCKLIST_FILE  key-image blocklist file override (default
+ *                          .keyimage-blocklist.json beside package.json) —
+ *                          used by tests (throwaway files) and parallel runs.
  */
 
 import {
@@ -62,9 +69,16 @@ import { sha256 } from "@noble/hashes/sha256";
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils";
 import { readSync } from "node:fs";
 import { randomBytes, randomInt } from "node:crypto";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { bech32 } from "@scure/base";
 import { WebSocket } from "ws";
 import { startRelay, type NostrEvent } from "./relay.js";
+import {
+  blockKeyImage,
+  isKeyImageBlocked,
+  loadKeyImageBlocklist,
+} from "./blocklist.js";
 
 // ─── ASCII helpers ──────────────────────────────────────────────
 
@@ -210,7 +224,7 @@ function rolesDiagram(): void {
     "          in YOUR trust ring\"",
     "   TAKER ------------------->  MAKER   (verifies: nobody learns which)",
     "",
-    "      3) sats over Lightning — ONLY if proof valid",
+    "      3) sats over Lightning — proof valid AND key image clean",
     "   TAKER <-------------------  MAKER",
     "",
     "      4) BLIK code delivered",
@@ -495,6 +509,20 @@ export function relayPort(): number {
   if (raw === undefined || raw === "") return DEFAULT_RELAY_PORT;
   const n = Number.parseInt(raw, 10);
   return Number.isNaN(n) ? DEFAULT_RELAY_PORT : n;
+}
+
+/**
+ * Where the maker's key-image blocklist lives (T2). Default: a dotfile
+ * beside package.json. TRUST_DEMO_BLOCKLIST_FILE overrides — tests point
+ * it at throwaway tmp files, parallel demo runs at their own files.
+ */
+export function blocklistPath(): string {
+  const raw = process.env.TRUST_DEMO_BLOCKLIST_FILE;
+  if (raw !== undefined && raw !== "") return raw;
+  return path.join(
+    fileURLToPath(new URL("..", import.meta.url)),
+    ".keyimage-blocklist.json",
+  );
 }
 
 /** Reject with `what` if `p` does not settle within WS_TIMEOUT_MS. */
@@ -1017,8 +1045,106 @@ export async function main(
     "screen was computed in this process, just now.",
   ]));
 
-  // ── 4. Nullifier reuse detection ─────────────────────────────
-  section("4. Nullifier reuse detection (linkability)", opts);
+  // ── 4. Key-image blocklist gate — sats on the line (T2) ──────
+  section("4. Key-image blocklist gate — sats on the line", opts);
+  explain(
+    "Verification proves membership, not honesty. Before ANY sats move,\n" +
+      "the maker checks the proof's key image against a PERSISTED blocklist\n" +
+      "of nullifiers from past disputed trades — and pays only if it is clean.",
+  );
+
+  const blPath = blocklistPath();
+  const takerKeyImageHex = hex(verifySig.keyImage);
+  const persistedImages = await loadKeyImageBlocklist(blPath);
+  console.log(
+    `maker: blocklist file ${blPath} — ${persistedImages.length} persisted key image(s)`,
+  );
+
+  // THE ordering claim of T2: the gate is evaluated BEFORE the sats step.
+  // A valid ring signature is necessary but NOT sufficient — a known-bad
+  // nullifier withholds the payment outright.
+  let cleanPaid = false;
+  if (await isKeyImageBlocked(blPath, takerKeyImageHex)) {
+    console.log(
+      `✋ SATS WITHHELD — key image ${truncate(takerKeyImageHex, 24)} is on ` +
+        `the maker's blocklist; refusing to pay ${amountSats} sats`,
+    );
+    console.log(
+      box("Known-bad taker — sats withheld", [
+        check("proof verified, but the nullifier is blocklisted", true),
+        "",
+        "The maker refuses this trade. The persisted",
+        "blocklist outlives the process that wrote it.",
+      ]),
+    );
+  } else {
+    console.log(
+      box("Blocklist gate — clean taker", [
+        check(
+          `key image ${truncate(takerKeyImageHex, 16)} NOT on the blocklist`,
+          true,
+        ),
+        "",
+        "The taker's nullifier is unknown to the maker —",
+        "no prior dispute on record. Sats may move.",
+      ]),
+    );
+    console.log(`→ maker: paying ${amountSats} sats over Lightning`);
+    console.log("→ taker: BLIK code delivered");
+    cleanPaid = true;
+  }
+
+  // Dispute replay: the trade settles, the BLIK code later turns out to
+  // be funded by a stolen card — the maker persists the taker's nullifier
+  // to their blocklist (a plain JSON file that survives restarts).
+  console.log();
+  console.log(
+    "dispute: the code was funded by a stolen card — the maker persists the taker's key image",
+  );
+  await blockKeyImage(blPath, takerKeyImageHex);
+  console.log(
+    `maker: key image ${truncate(takerKeyImageHex, 16)} persisted to the ` +
+      `blocklist — survives restarts`,
+  );
+
+  // The SAME taker returns with a fresh proof for a NEW offer (fresh
+  // maker_nonce → fresh message). Verification still passes — they
+  // genuinely are in the ring — but the gate now refuses to pay.
+  const replayBinding: TradeBinding = {
+    ...binding,
+    makerNonce: randomBytes(8).toString("hex"),
+  };
+  const replayMessage = buildBindingMessage(replayBinding);
+  const replaySig = sign(replayMessage, ring, takerIndex, takerSecret);
+  const replayValid = verify(replayMessage, ring, replaySig);
+
+  // The gate RE-READS the file from disk — not in-memory state — so what
+  // was just persisted is what gets enforced, in this process or any other.
+  const reloadedImages = await loadKeyImageBlocklist(blPath);
+  console.log(
+    `maker: blocklist re-loaded from disk — ${reloadedImages.length} persisted key image(s)`,
+  );
+  const replayBlocked = reloadedImages.includes(takerKeyImageHex);
+  console.log(
+    `✋ SATS WITHHELD — key image ${truncate(takerKeyImageHex, 24)} is on ` +
+      `the maker's blocklist; refusing to pay ${amountSats} sats`,
+  );
+  console.log(
+    box("Known-bad taker returns — sats withheld", [
+      check("new proof still verifies (taker IS in the ring)", replayValid),
+      check(
+        "key image unchanged (same nullifier)",
+        hex(replaySig.keyImage) === takerKeyImageHex,
+      ),
+      check("payment refused — key image on the persisted blocklist", replayBlocked),
+      "",
+      "A valid ring signature is necessary but NOT",
+      "sufficient: the gate runs BEFORE the sats step.",
+    ]),
+  );
+
+  // ── 5. Nullifier reuse detection ─────────────────────────────
+  section("5. Nullifier reuse detection (linkability)", opts);
   explain(
     "Every signature carries a nullifier — a fingerprint of the\n" +
       "secret key. Same taker signs twice → same nullifier →\n" +
@@ -1061,8 +1187,8 @@ export async function main(
     "takers from new ones.",
   ]));
 
-  // ── 5. Security checks ───────────────────────────────────────
-  section("5. Security checks", opts);
+  // ── 6. Security checks ───────────────────────────────────────
+  section("6. Security checks", opts);
   explain(
     "Break it every way an attacker would: wrong key, tampered\n" +
       "message, tampered response, tampered nullifier.\n" +
@@ -1070,16 +1196,16 @@ export async function main(
   );
 
   // All four checks always run; only the printing depends on --quick.
-  // 5a. Wrong secret key
+  // 6a. Wrong secret key
   const wrongKey = generateKeyPair();
   const sigWrong = sign(message, ring, takerIndex, wrongKey.secretKey);
   const wrongKeyResult = verify(message, ring, sigWrong);
 
-  // 5b. Tampered message (B2: tampered trade terms — the amount is signed)
+  // 6b. Tampered message (B2: tampered trade terms — the amount is signed)
   const tamperedMsg = buildBindingMessage({ ...binding, amount: "50001" });
   const tamperedMsgResult = verify(tamperedMsg, ring, sig);
 
-  // 5c. Tampered response
+  // 6c. Tampered response
   const tamperedSig: LSAGSignature = {
     ...sig,
     responses: [
@@ -1089,7 +1215,7 @@ export async function main(
   };
   const tamperedRespResult = verify(message, ring, tamperedSig);
 
-  // 5d. Tampered key image
+  // 6d. Tampered key image
   const tamperedKeyImageSig: LSAGSignature = {
     ...sig,
     keyImage: secp256k1.Point.BASE.toBytes(),
@@ -1104,25 +1230,25 @@ export async function main(
     // Collapse the four checks into one line to pace a 1-minute demo.
     console.log(`All 4 security checks passed: ${securityChecksPass ? "✅" : "❌"}`);
   } else {
-    console.log(box("5a. Wrong secret key", [
+    console.log(box("6a. Wrong secret key", [
       check("Signature with wrong key rejected", !wrongKeyResult),
       `The taker must know the secret key for ${nameOf(takerKeyIndex)}`,
       "to produce a valid proof.",
     ]));
 
-    console.log(box("5b. Tampered message", [
+    console.log(box("6b. Tampered message", [
       check("Tampered message rejected", !tamperedMsgResult),
       "Changing the signed message invalidates",
       "the ring signature.",
     ]));
 
-    console.log(box("5c. Tampered response", [
+    console.log(box("6c. Tampered response", [
       check("Tampered response rejected", !tamperedRespResult),
       "Modifying any response scalar breaks the",
       "ring closure and verification fails.",
     ]));
 
-    console.log(box("5d. Tampered key image (nullifier)", [
+    console.log(box("6d. Tampered key image (nullifier)", [
       check("Tampered key image rejected", !tamperedKeyImageResult),
       "Substituting the key image invalidates the",
       "signature — the nullifier is bound to the",
@@ -1133,11 +1259,15 @@ export async function main(
   // ── Summary ──────────────────────────────────────────────────
   section("Summary", opts);
 
+  // T2: the gate verdict — clean key image paid, known-bad withheld.
+  const blocklistGateOk = cleanPaid && replayBlocked && replayValid;
+
   const allPass =
     isValid &&
     bothValid &&
     sameKeyImage &&
     differentKeyImage &&
+    blocklistGateOk &&
     !wrongKeyResult &&
     !tamperedMsgResult &&
     !tamperedRespResult &&
@@ -1147,6 +1277,7 @@ export async function main(
     check("Valid signature verifies", isValid),
     check("Linkability (same nullifier for same taker)", sameKeyImage),
     check("Different takers have different nullifiers", differentKeyImage),
+    check("Blocklist gate: clean paid, known-bad withheld", blocklistGateOk),
     check("Wrong key rejected", !wrongKeyResult),
     check("Tampered message rejected", !tamperedMsgResult),
     check("Tampered response rejected", !tamperedRespResult),

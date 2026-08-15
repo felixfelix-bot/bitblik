@@ -116,7 +116,7 @@ describe("demo: key-image blocklist gate (T2)", () => {
     expect(doc.v).toBe(1);
     expect(doc.blocked.length).toBeGreaterThanOrEqual(1);
     for (const k of doc.blocked) {
-      expect(k).toMatch(/^[0-9a-f]{64}$/);
+      expect(k).toMatch(/^(02|03)[0-9a-f]{64}$/);
     }
   }, 30_000);
 

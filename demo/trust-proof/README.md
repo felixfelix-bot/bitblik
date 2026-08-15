@@ -179,7 +179,9 @@ A taker who wants to sell to a specific maker checks that maker's kind 3 list (p
    - If `I` is in the DB with a different `offer_id` → same signer detected (per-offer policy: allowed for new offers)
    - If `I` is not in the DB → store and accept
 
-6. **Result**: The maker knows the taker is in their own ring, does NOT know which specific pubkey, and the key image prevents proof replay.
+6. **Blocklist gate (T2) — BEFORE any sats move**: verification proves membership, not honesty. Before paying, the maker checks the proof's key image against their PERSISTED deny list of nullifiers from past disputed trades ([`src/blocklist.ts`](src/blocklist.ts); a plain JSON file `{"v":1,"blocked":["<66-hex key image>",...]}`, default `.keyimage-blocklist.json` beside `package.json`, overridable with `TRUST_DEMO_BLOCKLIST_FILE`). A known-bad key image → sats withheld with an explicit refusal message; a clean one → the maker pays. The file outlives the process that wrote it — the blocklist survives restarts — and a corrupt file fails LOUD (throwing) rather than silently un-blocking known-bad takers.
+
+7. **Result**: The maker knows the taker is in their own ring, does NOT know which specific pubkey, the key image prevents proof replay, and the blocklist gate keeps known-bad nullifiers from ever being paid again.
 
 ### 3.5 The Verify Equation (Corrected)
 
@@ -288,6 +290,11 @@ kind 30221 event over a WebSocket — publish, REQ, verify from the wire.
 | `--relay` | Real Nostr WS transport — this is the DEFAULT; the flag is accepted for explicitness |
 | `--offline` | Print-only path: no relay, no sockets (pre-transport behavior; if both flags appear, `--offline` wins) |
 
+**Key-image blocklist file (T2).** The maker's persisted deny list of
+nullifiers lives at `.keyimage-blocklist.json` beside `package.json`
+(gitignored). Point `TRUST_DEMO_BLOCKLIST_FILE` elsewhere for tests or
+parallel demo runs — same policy as `TRUST_DEMO_RELAY_PORT`.
+
 ### Preflight — one-line confidence check
 
 ```bash
@@ -376,7 +383,7 @@ npx tsc --noEmit
 
 ## 5. Demo Output
 
-The demo runs through 5 numbered sections plus a summary, with ASCII box output. With `--quick` the security checks collapse to one line; with `--interactive` it pauses after each section header (see [PRESENTER.md](PRESENTER.md) for a live-demo script). The demo's ring of five generated keys plays the role of the verifying maker's trust ring; the taker is secretly maker[2] (Carol), and their position in the ring is uniformly shuffled at construction (H2) — the signature leaks no fixed signer index, and the shuffled order is what gets signed and hashed.
+The demo runs through 6 numbered sections plus a summary, with ASCII box output. Section 4 is the key-image blocklist gate (T2): before any sats move, the maker checks the proof's key image against a persisted deny list — a clean taker gets paid, a known-bad nullifier is refused with an explicit message, and the disputed entry survives in the JSON file for future runs. With `--quick` the security checks collapse to one line; with `--interactive` it pauses after each section header (see [PRESENTER.md](PRESENTER.md) for a live-demo script). The demo's ring of five generated keys plays the role of the verifying maker's trust ring; the taker is secretly maker[2] (Carol), and their position in the ring is uniformly shuffled at construction (H2) — the signature leaks no fixed signer index, and the shuffled order is what gets signed and hashed.
 
 ```
 ================================================================
@@ -438,8 +445,40 @@ The demo runs through 5 numbered sections plus a summary, with ASCII box output.
 | which of the 5 makers produced the signature.                |
 +--------------------------------------------------------------+
 
++--------------------------------------------------------------+
+|          4. Key-image blocklist gate — sats on the line       |
++--------------------------------------------------------------+
+maker: blocklist file .keyimage-blocklist.json — 0 persisted key image(s)
+
++--------------------------------------------------------------+
+| Blocklist gate — clean taker                                 |
+|--------------------------------------------------------------|
+| [+] key image 02b902edd30e0da2... NOT on the blocklist       |
+|                                                              |
+| The taker's nullifier is unknown to the maker —              |
+| no prior dispute on record. Sats may move.                   |
++--------------------------------------------------------------+
+→ maker: paying 50000 sats over Lightning
+→ taker: BLIK code delivered
+
+dispute: the code was funded by a stolen card — the maker persists the taker's key image
+maker: key image 02b902edd30e0da2... persisted to the blocklist — survives restarts
+maker: blocklist re-loaded from disk — 1 persisted key image(s)
+✋ SATS WITHHELD — key image 02b902edd30e0da2e50aa887... is on the maker's blocklist; refusing to pay 50000 sats
+
++--------------------------------------------------------------+
+| Known-bad taker returns — sats withheld                      |
+|--------------------------------------------------------------|
+| [+] new proof still verifies (taker IS in the ring)          |
+| [+] key image unchanged (same nullifier)                     |
+| [+] payment refused — key image on the persisted blocklist   |
+|                                                              |
+| A valid ring signature is necessary but NOT                  |
+| sufficient: the gate runs BEFORE the sats step.              |
++--------------------------------------------------------------+
+
 +==============================================================+
-|          4. Nullifier reuse detection (linkability)          |
+|          5. Nullifier reuse detection (linkability)          |
 +==============================================================+
 +--------------------------------------------------------------+
 | Same taker, two signatures                                   |
@@ -464,7 +503,7 @@ The demo runs through 5 numbered sections plus a summary, with ASCII box output.
 +--------------------------------------------------------------+
 
 +==============================================================+
-|                      5. Security checks                      |
+|                      6. Security checks                      |
 +==============================================================+
 All 4 security checks passed: ✅
 
@@ -541,13 +580,17 @@ For the demo, ring-only gives a cleaner story: one cryptographic claim ("I'm in 
 As an optional gate between `reserved` and `blikReceived`:
 
 ```
-funded → reserved → [TRUST_PROOF_VERIFIED] → blikReceived → ...
-                     ↑
-                     maker verifies taker's
-                     ring signature here
+funded → reserved → [TRUST_PROOF_VERIFIED] → [BLOCKLIST GATE] → blikReceived → ...
+                     ↑                            ↑
+                     maker verifies taker's       known-bad key image?
+                     ring signature here          sats withheld BEFORE payment
 ```
 
-The taker includes the trust proof in the `submit_blik` RPC params (demo approach) or publishes a kind 38384 event (production approach). The maker verifies before calling `get_blik`.
+The taker includes the trust proof in the `submit_blik` RPC params (demo approach) or publishes a kind 38384 event (production approach). The maker verifies before calling `get_blik`, and the T2 blocklist gate runs before any sats move.
+
+**Q: The proof verifies but this taker defrauded the maker before — can payment still be refused?**
+
+Yes — that is exactly the T2 blocklist gate. Verification proves ring membership, not honesty: a stolen-card-funded BLIK code can come from a genuine ring member. Before paying, the maker checks the proof's key image against their persisted deny list (`.keyimage-blocklist.json`); a known-bad nullifier withholds the sats with an explicit refusal message — before any payment is made. The key image is the perfect handle for this: constant per signer, unlinkable to the pubkey, so the maker can refuse repeat offenders without ever learning (or revealing) who they are.
 
 **Q: What stops a taker from using someone else's pubkey in the ring?**
 

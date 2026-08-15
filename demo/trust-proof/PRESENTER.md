@@ -49,7 +49,7 @@ Run with:
 npx tsx src/demo.ts --interactive --quick
 ```
 
-`--interactive` pauses after each of the six section headers with
+`--interactive` pauses after each of the seven section headers with
 `[Enter] to continue...` — that's your cue to talk. Timings below sum to ~60s.
 (On screen, ring members are labeled `maker[0..4]` — legacy label from the
 coordinator-only framing; read them as "the pubkeys in the verifying maker's
@@ -76,18 +76,26 @@ ring".)
 > valid, signer really is in the ring — and, the point — the maker cannot tell
 > which of the five it was."
 
-### Pause 4 — `4. Nullifier reuse detection (linkability)` (~10s)
+### Pause 4 — `4. Key-image blocklist gate — sats on the line` (~10s)
+
+> "Membership isn't honesty — a real ring member can still hand you a
+> stolen-card-funded code. So before ANY sats move, the maker checks the
+> proof's key image against a persisted deny list. Clean nullifier: pay.
+> This one burned the maker before — payment withheld, and the blocklist
+> lives in a file that survives restarts."
+
+### Pause 5 — `5. Nullifier reuse detection (linkability)` (~10s)
 
 > "Same taker proves twice: same key image both times, so the maker can link
 > repeat provers — and still can't name them. A different taker yields a
 > different key image. Reuse detection without identification."
 
-### Pause 5 — `5. Security checks` (~5s, one line with --quick)
+### Pause 6 — `6. Security checks` (~5s, one line with --quick)
 
 > "And it's not forgeable: wrong key, tampered message, tampered response,
 > tampered nullifier — all four rejected."
 
-### Pause 6 — `Summary` (~10s)
+### Pause 7 — `Summary` (~10s)
 
 > "So: every maker curates their own ring, membership is proven without
 > identification, and a nullifier stops replay. Per-counterparty trust — the
@@ -117,6 +125,7 @@ is literally a CLI flag.
 | "Whose ring is this verified against?" | The specific maker you're transacting with. Every maker's kind 3 follow list IS their personal ring; proofs are per-maker and don't transfer. | [README §3.1–3.2, §6](README.md) |
 | "How does a new maker get a ring?" | One action: copy a published seed list (e.g. the coordinator's) to seed yours, then curate. Coordinator = seed/curator, not gatekeeper — no single party dictates trust. | [README §3.2, §6](README.md); [analysis §10](../../docs/trust-proof-analysis.md) |
 | "Can the taker reuse a proof / double-spend?" | The key image is the nullifier: same signer → same key image, always. Per-transaction policy — replaying the same proof to the same tx is rejected; a new tx gets a fresh signature over a new message. | [README §3.6](README.md) |
+| "The proof verifies but this taker burned me before — now what?" | That's the blocklist gate: the maker checks the key image against a PERSISTED deny list before paying. Known-bad nullifier → sats withheld with an explicit message; the file survives restarts. No identity needed — that's the point of the key image. | [README §3.4 step 6](README.md) |
 | "Could a proof for maker A be replayed to maker B?" | No — the signed message binds `amount` + `maker_nonce` + `offer_id` + `ring_hash`, and the ring itself is maker-specific, so ring-matching rejects it before the math even runs. | [analysis §10.3](../../docs/trust-proof-analysis.md) |
 | "Why LSAG and not Borromean ring signatures?" | Borromean isn't linkable — no key image, so no nullifier; we'd have to bolt on a weaker hash-based one. LSAG is secp256k1-native (Nostr keys work as-is) and comes from Monero's lineage. | [README §2](README.md) |
 | "What if a maker's ring is tiny?" | Anonymity set = ring size, so pad it with decoy pubkeys — the demo does it live with `--npub`. Bigger rings cost O(N) sign/verify. | [README §6](README.md); [analysis §10.3](../../docs/trust-proof-analysis.md) |

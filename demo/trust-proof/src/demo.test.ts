@@ -125,10 +125,10 @@ describe("demo", () => {
     const out = await captureMainOutput([]);
     const iValid = out.indexOf("Signature is valid");
     const iTamper = out.indexOf("Tamper test");
-    const iS4 = out.indexOf("4. Nullifier");
+    const iS5 = out.indexOf("5. Nullifier");
     expect(iValid).toBeGreaterThan(-1);
     expect(iTamper).toBeGreaterThan(iValid);
-    expect(iTamper).toBeLessThan(iS4);
+    expect(iTamper).toBeLessThan(iS5);
     expect(out).toContain("REJECTED");
   });
 
@@ -212,11 +212,11 @@ describe("demo output flags", () => {
 
   it("no flags: full security check details shown, no pause prompt", async () => {
     const out = await captureMainOutput({ interactive: false, quick: false });
-    expect(out).toContain("5. Security checks");
-    expect(out).toContain("5a. Wrong secret key");
-    expect(out).toContain("5b. Tampered message");
-    expect(out).toContain("5c. Tampered response");
-    expect(out).toContain("5d. Tampered key image");
+    expect(out).toContain("6. Security checks");
+    expect(out).toContain("6a. Wrong secret key");
+    expect(out).toContain("6b. Tampered message");
+    expect(out).toContain("6c. Tampered response");
+    expect(out).toContain("6d. Tampered key image");
     expect(out).not.toContain("[Enter] to continue...");
     expect(out).not.toContain("All 4 security checks passed");
   }, 30_000);
@@ -224,22 +224,22 @@ describe("demo output flags", () => {
   it("--quick: security checks collapse to a single summary line", async () => {
     const out = await captureMainOutput({ interactive: false, quick: true });
     expect(out).toContain("All 4 security checks passed: ✅");
-    expect(out).not.toContain("5a. Wrong secret key");
-    expect(out).not.toContain("5b. Tampered message");
-    expect(out).not.toContain("5c. Tampered response");
-    expect(out).not.toContain("5d. Tampered key image");
+    expect(out).not.toContain("6a. Wrong secret key");
+    expect(out).not.toContain("6b. Tampered message");
+    expect(out).not.toContain("6c. Tampered response");
+    expect(out).not.toContain("6d. Tampered key image");
   }, 30_000);
 
-  it("--interactive: pause prompt after each of the 6 section headers", async () => {
+  it("--interactive: pause prompt after each of the 7 section headers", async () => {
     const out = await captureMainOutput({ interactive: true, quick: false });
-    expect(out.match(/\[Enter\] to continue\.\.\./g)?.length).toBe(7);
+    expect(out.match(/\[Enter\] to continue\.\.\./g)?.length).toBe(8);
   }, 30_000);
 
   it("--interactive: injected waitForKey is called once per section", async () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
     const waitForKey = vi.fn();
     await main({ interactive: true, quick: false, waitForKey });
-    expect(waitForKey).toHaveBeenCalledTimes(7);
+    expect(waitForKey).toHaveBeenCalledTimes(8);
   }, 30_000);
 
   it("combined --interactive --quick works", async () => {
