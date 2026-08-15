@@ -1,0 +1,222 @@
+import { describe, it, expect } from "vitest";
+import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { randomBytes } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+  BLOCKLIST_FILE_VERSION,
+  isValidKeyImageHex,
+  normalizeKeyImageHex,
+  loadKeyImageBlocklist,
+  isKeyImageBlocked,
+  blockKeyImage,
+} from "./blocklist.js";
+
+// ─── Helpers ───────────────────────────────────────────────────
+
+const PKG_DIR = fileURLToPath(new URL("..", import.meta.url));
+const TSX_BIN = path.join(PKG_DIR, "node_modules", ".bin", "tsx");
+
+/** A random but perfectly valid 64-hex key image (crypto-random, like the real thing). */
+function fakeKeyImage(): string {
+  return randomBytes(32).toString("hex");
+}
+
+async function tmpBlocklistPath(): Promise<string> {
+  const dir = await mkdtemp(path.join(tmpdir(), "blocklist-test-"));
+  return path.join(dir, "blocklist.json");
+}
+
+// ─── key image hex validation ──────────────────────────────────
+
+describe("isValidKeyImageHex", () => {
+  it("accepts 64-char lowercase hex", () => {
+    expect(isValidKeyImageHex(fakeKeyImage())).toBe(true);
+  });
+
+  it("accepts 64-char uppercase hex (case-insensitive input)", () => {
+    expect(isValidKeyImageHex(fakeKeyImage().toUpperCase())).toBe(true);
+  });
+
+  it("rejects short, long, empty, and non-hex strings", () => {
+    expect(isValidKeyImageHex("ab")).toBe(false);
+    expect(isValidKeyImageHex(fakeKeyImage() + "ff")).toBe(false);
+    expect(isValidKeyImageHex("")).toBe(false);
+    expect(isValidKeyImageHex("g".repeat(64))).toBe(false);
+    // 33-byte compressed point (66 hex) is NOT a key image
+    expect(isValidKeyImageHex("02" + "a".repeat(64))).toBe(false);
+  });
+});
+
+describe("normalizeKeyImageHex", () => {
+  it("lowercases valid input", () => {
+    const k = fakeKeyImage();
+    expect(normalizeKeyImageHex(k.toUpperCase())).toBe(k);
+  });
+
+  it("throws a clear error for invalid input", () => {
+    expect(() => normalizeKeyImageHex("nothex")).toThrow(/Invalid key image/i);
+  });
+});
+
+// ─── persistence (JSON file) ───────────────────────────────────
+
+describe("loadKeyImageBlocklist", () => {
+  it("missing file → empty list, and does not create the file", async () => {
+    const p = await tmpBlocklistPath();
+    await expect(loadKeyImageBlocklist(p)).resolves.toEqual([]);
+    await expect(readFile(p, "utf8")).rejects.toThrow(); // still absent
+  });
+
+  it("reads back what blockKeyImage persisted", async () => {
+    const p = await tmpBlocklistPath();
+    const k = fakeKeyImage();
+    await blockKeyImage(p, k);
+    await expect(loadKeyImageBlocklist(p)).toEqual([k]);
+  });
+
+  it("malformed JSON file → throws (fail loud, never silently empty)", async () => {
+    const p = await tmpBlocklistPath();
+    await writeFile(p, "{not json", "utf8");
+    await expect(loadKeyImageBlocklist(p)).rejects.toThrow(/blocklist/i);
+  });
+
+  it("wrong schema version → throws", async () => {
+    const p = await tmpBlocklistPath();
+    await writeFile(p, JSON.stringify({ v: 99, blocked: [] }), "utf8");
+    await expect(loadKeyImageBlocklist(p)).rejects.toThrow(/version/i);
+  });
+
+  it("corrupt entry (not 64-hex) inside the file → throws", async () => {
+    const p = await tmpBlocklistPath();
+    await writeFile(p, JSON.stringify({ v: 1, blocked: ["ab"] }), "utf8");
+    await expect(loadKeyImageBlocklist(p)).rejects.toThrow(/blocklist/i);
+  });
+
+  it("non-array `blocked` field → throws", async () => {
+    const p = await tmpBlocklistPath();
+    await writeFile(p, JSON.stringify({ v: 1, blocked: "nope" }), "utf8");
+    await expect(loadKeyImageBlocklist(p)).rejects.toThrow(/blocklist/i);
+  });
+});
+
+describe("blockKeyImage", () => {
+  it("persists the exact JSON document shape {v:1, blocked:[keyImage]}", async () => {
+    const p = await tmpBlocklistPath();
+    const k = fakeKeyImage();
+    await blockKeyImage(p, k);
+    const doc = JSON.parse(await readFile(p, "utf8")) as { v: number; blocked: string[] };
+    expect(doc.v).toBe(BLOCKLIST_FILE_VERSION);
+    expect(doc.v).toBe(1);
+    expect(doc.blocked).toEqual([k]);
+  });
+
+  it("is idempotent — blocking the same key twice does not duplicate it", async () => {
+    const p = await tmpBlocklistPath();
+    const k = fakeKeyImage();
+    await blockKeyImage(p, k);
+    await blockKeyImage(p, k);
+    await expect(loadKeyImageBlocklist(p)).toEqual([k]);
+  });
+
+  it("preserves previously persisted entries (load-merge-save)", async () => {
+    const p = await tmpBlocklistPath();
+    const a = fakeKeyImage();
+    const b = fakeKeyImage();
+    await blockKeyImage(p, a);
+    await blockKeyImage(p, b);
+    const entries = await loadKeyImageBlocklist(p);
+    expect(entries).toEqual([a, b]);
+  });
+
+  it("normalizes input to lowercase before persisting", async () => {
+    const p = await tmpBlocklistPath();
+    const k = fakeKeyImage();
+    await blockKeyImage(p, k.toUpperCase());
+    await expect(loadKeyImageBlocklist(p)).toEqual([k]);
+  });
+
+  it("throws on invalid key image — never persists garbage", async () => {
+    const p = await tmpBlocklistPath();
+    await expect(blockKeyImage(p, "short")).rejects.toThrow(/Invalid key image/i);
+    const entries = await loadKeyImageBlocklist(p);
+    expect(entries).toEqual([]);
+  });
+});
+
+describe("isKeyImageBlocked", () => {
+  it("false for a fresh (empty) blocklist", async () => {
+    const p = await tmpBlocklistPath();
+    await expect(isKeyImageBlocked(p, fakeKeyImage())).resolves.toBe(false);
+  });
+
+  it("true only for the persisted key image", async () => {
+    const p = await tmpBlocklistPath();
+    const k = fakeKeyImage();
+    await blockKeyImage(p, k);
+    await expect(isKeyImageBlocked(p, k)).resolves.toBe(true);
+    await expect(isKeyImageBlocked(p, fakeKeyImage())).resolves.toBe(false);
+  });
+
+  it("matches case-insensitively (same key image, uppercase query)", async () => {
+    const p = await tmpBlocklistPath();
+    const k = fakeKeyImage();
+    await blockKeyImage(p, k);
+    await expect(isKeyImageBlocked(p, k.toUpperCase())).resolves.toBe(true);
+  });
+
+  it("throws on invalid input key image", async () => {
+    const p = await tmpBlocklistPath();
+    await expect(isKeyImageBlocked(p, "zz")).rejects.toThrow(/Invalid key image/i);
+  });
+});
+
+// ─── cross-process persistence (T2 acceptance) ─────────────────
+
+describe("persistence survives a fresh process", () => {
+  it("a spawned process reading the file sees the blocked key image", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "blocklist-xproc-"));
+    const p = path.join(dir, "blocklist.json");
+    const known = fakeKeyImage();
+    const other = fakeKeyImage();
+
+    // Writer: THIS vitest worker process.
+    await blockKeyImage(p, known);
+
+    // Reader: a FRESH tsx process (new module registry, new everything)
+    // that imports the real module and reads the same file.
+    const blocklistUrl = pathToFileURL(
+      path.join(PKG_DIR, "src", "blocklist.ts"),
+    ).href;
+    const readerPath = path.join(dir, "reader.mts");
+    await writeFile(
+      readerPath,
+      [
+        `import { loadKeyImageBlocklist, isKeyImageBlocked } from ${JSON.stringify(blocklistUrl)};`,
+        "async function run() {",
+        "  const [file, knownArg, otherArg] = process.argv.slice(2);",
+        "  const entries = await loadKeyImageBlocklist(file);",
+        '  console.log("entries=" + entries.length);',
+        '  console.log("known=" + ((await isKeyImageBlocked(file, knownArg)) ? "BLOCKED" : "CLEAN"));',
+        '  console.log("other=" + ((await isKeyImageBlocked(file, otherArg)) ? "BLOCKED" : "CLEAN"));',
+        "}",
+        "run();",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const out = execFileSync(TSX_BIN, [readerPath, p, known, other], {
+      cwd: PKG_DIR,
+      encoding: "utf8",
+      timeout: 60_000,
+    });
+    expect(out).toContain("entries=1");
+    expect(out).toContain("known=BLOCKED");
+    expect(out).toContain("other=CLEAN");
+
+    await rm(dir, { recursive: true, force: true });
+  }, 90_000);
+});
