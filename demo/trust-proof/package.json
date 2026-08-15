@@ -11,7 +11,9 @@
     "demo": "tsx src/demo.ts",
     "relay": "tsx src/relay-standalone.ts",
     "preflight": "tsx src/preflight.ts",
-    "test:cov": "vitest run --coverage"
+    "test:cov": "vitest run --coverage",
+    "vectors:emit": "tsx src/lsag.emitVectors.ts",
+    "vectors:crosscheck": "tsx src/lsag.emitVectors.ts && python3 tools/lsag_ref.py verify --file vectors/ts-emitted-vectors.json"
   },
   "dependencies": {
     "@noble/curves": "^1.6.0",
