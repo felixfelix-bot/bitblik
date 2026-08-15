@@ -869,3 +869,85 @@ describe("B1: verify uses the caller's ring — the event ring tag is display-on
     expect(out).not.toContain("ring rebuilt from event tags");
   }, 30_000);
 });
+
+// ─── H2: shuffled signer position ──────────────────────────────
+
+describe("H2: signer index is uniformly shuffled in ring construction", () => {
+  const keys = Array.from({ length: 5 }, () => generateKeyPair());
+  const makerPks = keys.map((k) => k.publicKey);
+
+  async function demoExports() {
+    return (await import("./demo.js")) as unknown as Record<string, unknown>;
+  }
+
+  it("demo exports buildShuffledRing(); ring is a permutation, taker findable, sig verifies", async () => {
+    const mod = await demoExports();
+    expect(typeof mod.buildShuffledRing).toBe("function");
+    const buildShuffledRing = mod.buildShuffledRing as (
+      makerPublicKeys: Uint8Array[],
+      takerLocalIndex: number,
+      decoys?: Uint8Array[],
+    ) => { ring: Uint8Array[]; takerIndex: number };
+
+    const { ring, takerIndex } = buildShuffledRing(makerPks, 2);
+    expect(ring).toHaveLength(5);
+    expect(takerIndex).toBeGreaterThanOrEqual(0);
+    expect(takerIndex).toBeLessThan(5);
+    // same multiset of pubkeys (permutation, nothing added/removed)
+    const byHex = (arr: Uint8Array[]) => arr.map((pk) => bytesToHex(pk)).sort();
+    expect(byHex(ring)).toEqual(byHex(makerPks));
+    // the shuffled ring actually signs+verifies at the returned index
+    const msg = new TextEncoder().encode("H2 shuffle test");
+    const sig = sign(msg, ring, takerIndex, keys[2].secretKey);
+    expect(verify(msg, ring, sig)).toBe(true);
+  });
+
+  it("taker position is uniformly distributed — no fixed-index leak", async () => {
+    const mod = await demoExports();
+    const buildShuffledRing = mod.buildShuffledRing as (
+      makerPublicKeys: Uint8Array[],
+      takerLocalIndex: number,
+      decoys?: Uint8Array[],
+    ) => { ring: Uint8Array[]; takerIndex: number };
+
+    const runs = 400;
+    const counts = new Array(5).fill(0);
+    for (let i = 0; i < runs; i++) {
+      const { takerIndex } = buildShuffledRing(makerPks, 2);
+      counts[takerIndex]++;
+    }
+    // uniform expectation: 80 per position; fixed-index bug: 400 at one.
+    // bounds ±6σ of Binomial(400, 1/5) — cannot flake in practice.
+    for (const c of counts) {
+      expect(c).toBeGreaterThanOrEqual(30);
+      expect(c).toBeLessThanOrEqual(170);
+    }
+  });
+
+  it("shuffles decoys into the ring too, taker still uniformly placed", async () => {
+    const mod = await demoExports();
+    const buildShuffledRing = mod.buildShuffledRing as (
+      makerPublicKeys: Uint8Array[],
+      takerLocalIndex: number,
+      decoys?: Uint8Array[],
+    ) => { ring: Uint8Array[]; takerIndex: number };
+
+    const decoy = generateKeyPair().publicKey;
+    const runs = 300;
+    const counts = new Array(6).fill(0);
+    for (let i = 0; i < runs; i++) {
+      const { ring, takerIndex } = buildShuffledRing(makerPks, 2, [decoy]);
+      expect(ring).toHaveLength(6);
+      counts[takerIndex]++;
+    }
+    for (const c of counts) {
+      expect(c).toBeGreaterThanOrEqual(20);
+      expect(c).toBeLessThanOrEqual(130);
+    }
+  });
+
+  it("demo output reports the shuffled ring position (no fixed index)", async () => {
+    const out = await captureMainOutput([]);
+    expect(out).toContain("ring position: shuffled");
+  }, 30_000);
+});
