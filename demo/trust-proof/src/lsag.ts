@@ -236,6 +236,12 @@ export function sign(
 
 /**
  * Verify an LSAG signature.
+ *
+ * B4 hardening: the ring must be well-formed before any math runs —
+ * at least 4 pubkeys, no duplicate points (in any encoding), and every
+ * entry in canonical form (exactly 33 bytes, prefix 0x02 or 0x03 —
+ * compressed). Uncompressed/hybrid encodings of otherwise-valid points
+ * are rejected, so a point can only appear once and only one way.
  */
 export function verify(
   message: Uint8Array,
@@ -243,7 +249,7 @@ export function verify(
   sig: LSAGSignature,
 ): boolean {
   const n = ring.length;
-  if (n === 0) return false;
+  if (n < 4) return false;
   if (sig.responses.length !== n) return false;
 
   // Key image must be a valid, non-identity point.
@@ -256,15 +262,28 @@ export function verify(
   }
   if (I.is0?.() ?? false) return false;
 
-  // Precompute H(P_i); each ring member must be a valid point.
+  // Precompute H(P_i); each ring member must be a canonical, valid,
+  // non-duplicate point.
   const H: Uint8Array[] = [];
+  const seen = new Set<string>();
   for (let i = 0; i < n; i++) {
+    const pk = ring[i];
+    // Canonical encoding check FIRST: 33 bytes, compressed prefix only.
+    // (Point.fromBytes would happily accept a 65-byte uncompressed
+    // encoding of a valid point — that must not slip through.)
+    if (pk.length !== 33 || (pk[0] !== 0x02 && pk[0] !== 0x03)) return false;
     try {
-      Point.fromBytes(ring[i]).assertValidity();
-      H.push(hashToCurve(ring[i]));
+      Point.fromBytes(pk).assertValidity();
+      H.push(hashToCurve(pk));
     } catch {
       return false;
     }
+    // With canonical encodings enforced, byte equality ⟺ point equality.
+    const canonical = Array.from(pk)
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+    if (seen.has(canonical)) return false; // duplicate point
+    seen.add(canonical);
   }
 
   // B6: challenges fold (message || ring || keyImage) under LSAG/v2 —

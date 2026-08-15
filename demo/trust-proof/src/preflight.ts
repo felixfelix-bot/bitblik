@@ -134,9 +134,15 @@ function messageQueue(ws: WebSocket): { next: (stage: string) => Promise<unknown
 export async function runPreflight(): Promise<PreflightResult> {
   const t0 = performance.now();
 
-  // 1. The demo's core crypto: a real LSAG proof over a 3-key ring.
-  //    B2: the signed message is the canonical trade-binding digest.
-  const keys = [generateKeyPair(), generateKeyPair(), generateKeyPair()];
+  // 1. The demo's core crypto: a real LSAG proof over a 4-key ring
+  //    (B4 minimum ring size). B2: the signed message is the canonical
+  //    trade-binding digest.
+  const keys = [
+    generateKeyPair(),
+    generateKeyPair(),
+    generateKeyPair(),
+    generateKeyPair(),
+  ];
   const ring = keys.map((k) => k.publicKey);
   const binding: TradeBinding = {
     amount: "21000",
@@ -155,7 +161,7 @@ export async function runPreflight(): Promise<PreflightResult> {
   const { event } = buildNostrEvent(
     publisher,
     ring.map((pk) => bytesToHex(pk)),
-    ["pf-a", "pf-b", "pf-c"],
+    ["pf-a", "pf-b", "pf-c", "pf-d"],
     binding.offerId,
     JSON.stringify({
       binding: JSON.parse(bindingToJson(binding)),

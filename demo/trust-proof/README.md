@@ -160,9 +160,11 @@ A taker who wants to sell to a specific maker checks that maker's kind 3 list (p
 
 **Steps:**
 
-1. **Verify ring matches follow list**: `proof.ring_pubkeys` must match the `p` tags from the maker's own kind 3 event (or be a subset, if subset rings are allowed).
+1. **Reject degenerate rings** (B4): fewer than 4 pubkeys, any duplicate point (the same key twice, or the same point under different encodings), or any non-canonical point encoding (only 33-byte compressed `0x02`/`0x03` entries are accepted — uncompressed 65-byte forms are rejected outright).
 
-2. **Recompute the ring** (challenges use the same LSAG/v2 fold as signing):
+2. **Verify ring matches follow list**: `proof.ring_pubkeys` must match the `p` tags from the maker's own kind 3 event (or be a subset, if subset rings are allowed).
+
+3. **Recompute the ring** (challenges use the same LSAG/v2 fold as signing):
    ```
    c_1 = H("LSAG/v2", m, ring, I, r_0 · G + c_0 · P_0, r_0 · H(P_0) + c_0 · I)
    c_2 = H("LSAG/v2", m, ring, I, r_1 · G + c_1 · P_1, r_1 · H(P_1) + c_1 · I)
@@ -170,14 +172,14 @@ A taker who wants to sell to a specific maker checks that maker's kind 3 list (p
    c_0' = H("LSAG/v2", m, ring, I, r_{N-1} · G + c_{N-1} · P_{N-1}, r_{N-1} · H(P_{N-1}) + c_{N-1} · I)
    ```
 
-3. **Check closure**: `c_0' == c_0`. If the ring closes, the signature is valid.
+4. **Check closure**: `c_0' == c_0`. If the ring closes, the signature is valid.
 
-4. **Check nullifier (key image)**:
+5. **Check nullifier (key image)**:
    - If `I` is in the local nullifier DB with the same `offer_id` → already verified (idempotent OK)
    - If `I` is in the DB with a different `offer_id` → same signer detected (per-offer policy: allowed for new offers)
    - If `I` is not in the DB → store and accept
 
-5. **Result**: The maker knows the taker is in their own ring, does NOT know which specific pubkey, and the key image prevents proof replay.
+6. **Result**: The maker knows the taker is in their own ring, does NOT know which specific pubkey, and the key image prevents proof replay.
 
 ### 3.5 The Verify Equation (Corrected)
 
