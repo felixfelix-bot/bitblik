@@ -19,6 +19,7 @@ import {
   parseNpubArgs,
   generatePublisher,
   buildNostrEvent,
+  proofFromWireEvent,
 } from "./demo.js";
 import { generateKeyPair, sign, verify } from "./lsag.js";
 import { startRelay } from "./relay.js";
@@ -629,4 +630,135 @@ describe("CLI end-to-end (R3 relay mode)", () => {
     expect(out).not.toContain("[!] relay unavailable");
     expect(out).toContain("Demo complete.");
   }, 90_000);
+});
+
+// ─── B2: canonical trade-binding message ───────────────────────
+
+describe("B2: canonical trade-binding message", () => {
+  const keys = Array.from({ length: 4 }, () => generateKeyPair());
+  const ring = keys.map((k) => k.publicKey);
+  const ringHashHex = bytesToHex(
+    sha256(new Uint8Array(Buffer.concat(ring.map((pk) => Buffer.from(pk))))),
+  );
+
+  async function demoExports() {
+    const mod = (await import("./demo.js")) as unknown as Record<string, unknown>;
+    return mod;
+  }
+
+  it("demo exports ringHash(): sha256 over the ORDERED concat of ring pubkeys", async () => {
+    const mod = await demoExports();
+    expect(typeof mod.ringHash).toBe("function");
+    const ringHash = mod.ringHash as (r: Uint8Array[]) => string;
+    expect(ringHash(ring)).toBe(ringHashHex);
+    // ring order is binding: swapping two members changes the hash
+    const swapped = [ring[1], ring[0], ring[2], ring[3]];
+    expect(ringHash(swapped)).not.toBe(ringHashHex);
+  });
+
+  it("buildBindingMessage(): sha256 over lexicographic canonical JSON, no whitespace", async () => {
+    const mod = await demoExports();
+    expect(typeof mod.buildBindingMessage).toBe("function");
+    const buildBindingMessage = mod.buildBindingMessage as (b: {
+      amount: string;
+      makerNonce: string;
+      offerId: string;
+      ringHash: string;
+    }) => Uint8Array;
+    const canonical =
+      `{"amount":"50000","maker_nonce":"aabbccddeeff0011",` +
+      `"offer_id":"1122334455667788","ring_hash":"${ringHashHex}",` +
+      `"type":"bitblik.trust-proof","v":1}`;
+    const digest = buildBindingMessage({
+      amount: "50000",
+      makerNonce: "aabbccddeeff0011",
+      offerId: "1122334455667788",
+      ringHash: ringHashHex,
+    });
+    expect(digest).toHaveLength(32); // the message IS the sha256 digest
+    expect(bytesToHex(digest)).toBe(
+      bytesToHex(sha256(new TextEncoder().encode(canonical))),
+    );
+  });
+
+  it("every binding field changes the message — each field is signed", async () => {
+    const mod = await demoExports();
+    const buildBindingMessage = mod.buildBindingMessage as (b: {
+      amount: string;
+      makerNonce: string;
+      offerId: string;
+      ringHash: string;
+    }) => Uint8Array;
+    const base = {
+      amount: "50000",
+      makerNonce: "aabbccddeeff0011",
+      offerId: "1122334455667788",
+      ringHash: ringHashHex,
+    };
+    const digest = bytesToHex(buildBindingMessage(base));
+    for (const mutated of [
+      { ...base, amount: "50001" },
+      { ...base, makerNonce: "aabbccddeeff0012" },
+      { ...base, offerId: "1122334455667789" },
+      { ...base, ringHash: "00".repeat(32) },
+    ]) {
+      expect(bytesToHex(buildBindingMessage(mutated))).not.toBe(digest);
+    }
+  });
+
+  it("demo output carries the binding (type bitblik.trust-proof) in the event", async () => {
+    const out = await captureMainOutput([]);
+    expect(out).toContain("bitblik.trust-proof");
+  }, 30_000);
+
+  it("demo output no longer claims tx_id binding — tx_id is a Phase-2 concept", async () => {
+    const out = await captureMainOutput([]);
+    expect(out).not.toContain("tx_id");
+  }, 30_000);
+
+  it("proofFromWireEvent rebuilds the message from the carried binding", async () => {
+    const mod = await demoExports();
+    const buildBindingMessage = mod.buildBindingMessage as (b: {
+      amount: string;
+      makerNonce: string;
+      offerId: string;
+      ringHash: string;
+    }) => Uint8Array;
+
+    const binding = {
+      amount: "21000",
+      makerNonce: randomBytes(8).toString("hex"),
+      offerId: randomBytes(8).toString("hex"),
+      ringHash: ringHashHex,
+    };
+    const message = buildBindingMessage(binding);
+    const sig = sign(message, ring, 1, keys[1].secretKey);
+    expect(verify(message, ring, sig)).toBe(true);
+
+    const { event } = buildNostrEvent(
+      generatePublisher(),
+      ring.map((pk) => bytesToHex(pk)),
+      ["a", "b", "c", "d"],
+      binding.offerId,
+      JSON.stringify({
+        binding: {
+          amount: binding.amount,
+          maker_nonce: binding.makerNonce,
+          offer_id: binding.offerId,
+          ring_hash: binding.ringHash,
+          type: "bitblik.trust-proof",
+          v: 1,
+        },
+        keyImage: bytesToHex(sig.keyImage),
+        c0: bytesToHex(sig.c0),
+        responses: sig.responses.map((r) => bytesToHex(r)),
+      }),
+    );
+
+    const parsed = proofFromWireEvent(event);
+    expect(Buffer.from(parsed.message).toString("hex")).toBe(
+      Buffer.from(message).toString("hex"),
+    );
+    expect(verify(parsed.message, parsed.ring, parsed.sig)).toBe(true);
+  });
 });
