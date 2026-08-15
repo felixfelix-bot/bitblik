@@ -2,9 +2,90 @@ import { describe, it, expect } from "vitest";
 import { generateKeyPair, hashToCurve, sign, verify } from "./lsag.js";
 import type { LSAGSignature } from "./lsag.js";
 import { secp256k1 } from "@noble/curves/secp256k1";
-import { bytesToNumberBE } from "@noble/curves/abstract/utils";
+import { sha256 } from "@noble/hashes/sha256";
+import { bytesToNumberBE, numberToBytesBE } from "@noble/curves/abstract/utils";
 
 const enc = new TextEncoder();
+const N = secp256k1.CURVE.n;
+const modN = (x: bigint): bigint => ((x % N) + N) % N;
+
+// ─── B6 spec oracle: replica signer ────────────────────────────
+// A self-contained reimplementation of LSAG signing, parameterized by the
+// challenge-hash layout, used to pin the EXACT challenge construction:
+//   domain = the hash's domain tag ("LSAG/v1" pre-hardening, "LSAG/v2" after)
+//   fold   = whether every challenge (base + links) folds
+//            (msg || ring || keyImage) ahead of the point components.
+// If verify() accepts the ("LSAG/v2", fold=true) replica and rejects the
+// ("LSAG/v1", fold=false) replica, the implementation matches the spec.
+
+function replicaConcat(...arrays: Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(arrays.reduce((n, a) => n + a.length, 0));
+  let off = 0;
+  for (const a of arrays) {
+    out.set(a, off);
+    off += a.length;
+  }
+  return out;
+}
+
+/** sha256 over [domain, each item 4-byte-BE-length-prefixed], reduced mod n. */
+function replicaHashToScalar(domain: string, items: Uint8Array[]): bigint {
+  const parts: Uint8Array[] = [enc.encode(domain)];
+  for (const it of items) {
+    const len = new Uint8Array(4);
+    new DataView(len.buffer).setUint32(0, it.length, false);
+    parts.push(len, it);
+  }
+  return bytesToNumberBE(sha256(replicaConcat(...parts))) % N;
+}
+
+function replicaSign(
+  message: Uint8Array,
+  ring: Uint8Array[],
+  s: number,
+  secretKey: Uint8Array,
+  opts: { domain: string; fold: boolean },
+): LSAGSignature {
+  const n = ring.length;
+  const H = ring.map((pk) => hashToCurve(pk));
+  const x_s = bytesToNumberBE(secretKey) % N;
+  const I = secp256k1.Point.fromBytes(H[s]).multiply(x_s).toBytes();
+  const ringBytes = replicaConcat(...ring);
+  const challenge = (pts: Uint8Array[]): bigint =>
+    opts.fold
+      ? replicaHashToScalar(opts.domain, [message, ringBytes, I, ...pts])
+      : replicaHashToScalar(opts.domain, [message, ...pts]);
+
+  const responses: bigint[] = Array.from(
+    { length: n },
+    () => bytesToNumberBE(secp256k1.utils.randomSecretKey()) % N,
+  );
+  const r_s_random = responses[s];
+
+  const challenges: bigint[] = new Array(n);
+  let c = challenge([
+    secp256k1.Point.BASE.multiply(r_s_random).toBytes(),
+    secp256k1.Point.fromBytes(H[s]).multiply(r_s_random).toBytes(),
+  ]);
+  challenges[(s + 1) % n] = c;
+
+  for (let step = 1; step < n; step++) {
+    const i = (s + step) % n;
+    const z1 = secp256k1.Point.BASE.multiply(responses[i])
+      .add(secp256k1.Point.fromBytes(ring[i]).multiply(c));
+    const z2 = secp256k1.Point.fromBytes(H[i]).multiply(responses[i])
+      .add(secp256k1.Point.fromBytes(I).multiply(c));
+    c = challenge([z1.toBytes(), z2.toBytes()]);
+    challenges[(i + 1) % n] = c;
+  }
+  responses[s] = modN(r_s_random - x_s * c);
+
+  return {
+    keyImage: I,
+    c0: numberToBytesBE(modN(challenges[0]), 32),
+    responses: responses.map((r) => numberToBytesBE(modN(r), 32)),
+  };
+}
 
 describe("generateKeyPair", () => {
   it("produces a 32-byte secret key and 33-byte compressed public key", () => {
@@ -177,5 +258,43 @@ describe("linkability (key image)", () => {
     const H_Ps = secp256k1.Point.fromBytes(hashToCurve(keys[idx].publicKey));
     const expected = H_Ps.multiply(x_s).toBytes();
     expect(sig.keyImage).toEqual(expected);
+  });
+});
+
+describe("B6: challenge hash binds (msg || ring || keyImage) under LSAG/v2", () => {
+  const keys = Array.from({ length: 4 }, () => generateKeyPair());
+  const ring = keys.map((k) => k.publicKey);
+  const message = enc.encode("B6 binding test");
+
+  it("accepts a v2 replica signature whose challenges fold msg || ring || keyImage", () => {
+    const sig = replicaSign(message, ring, 1, keys[1].secretKey, {
+      domain: "LSAG/v2",
+      fold: true,
+    });
+    expect(verify(message, ring, sig)).toBe(true);
+  });
+
+  it("rejects stale LSAG/v1 signatures — old proofs fail loudly after the domain bump", () => {
+    const sig = replicaSign(message, ring, 2, keys[2].secretKey, {
+      domain: "LSAG/v1",
+      fold: false,
+    });
+    expect(verify(message, ring, sig)).toBe(false);
+  });
+
+  it("rejects a v2-domain signature that omits the (ring, keyImage) fold", () => {
+    const sig = replicaSign(message, ring, 3, keys[3].secretKey, {
+      domain: "LSAG/v2",
+      fold: false,
+    });
+    expect(verify(message, ring, sig)).toBe(false);
+  });
+
+  it("rejects a v1-domain signature even with the fold — domain tag is part of the binding", () => {
+    const sig = replicaSign(message, ring, 0, keys[0].secretKey, {
+      domain: "LSAG/v1",
+      fold: true,
+    });
+    expect(verify(message, ring, sig)).toBe(false);
   });
 });
