@@ -376,7 +376,7 @@ npx tsc --noEmit
 
 ## 5. Demo Output
 
-The demo runs through 5 numbered sections plus a summary, with ASCII box output. With `--quick` the security checks collapse to one line; with `--interactive` it pauses after each section header (see [PRESENTER.md](PRESENTER.md) for a live-demo script). The demo's ring of five generated keys plays the role of the verifying maker's trust ring; the taker is the ring member at index 2.
+The demo runs through 5 numbered sections plus a summary, with ASCII box output. With `--quick` the security checks collapse to one line; with `--interactive` it pauses after each section header (see [PRESENTER.md](PRESENTER.md) for a live-demo script). The demo's ring of five generated keys plays the role of the verifying maker's trust ring; the taker is secretly maker[2] (Carol), and their position in the ring is uniformly shuffled at construction (H2) — the signature leaks no fixed signer index, and the shuffled order is what gets signed and hashed.
 
 ```
 ================================================================

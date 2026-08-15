@@ -61,7 +61,7 @@ import { secp256k1, schnorr } from "@noble/curves/secp256k1";
 import { sha256 } from "@noble/hashes/sha256";
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils";
 import { readSync } from "node:fs";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomInt } from "node:crypto";
 import { bech32 } from "@scure/base";
 import { WebSocket } from "ws";
 import { startRelay, type NostrEvent } from "./relay.js";
@@ -295,6 +295,44 @@ export function bindingToJson(binding: TradeBinding): string {
     type: "bitblik.trust-proof",
     v: 1,
   });
+}
+
+// ─── H2: shuffled signer position ──────────────────────────────
+
+/**
+ * Build the ring with the signer's position UNIFORMLY shuffled (H2).
+ *
+ * The old construction always placed the taker at a fixed index, which
+ * leaks the signer's position to anyone watching ring order. Here the
+ * combined maker + decoy pubkeys are shuffled with Fisher–Yates using
+ * crypto-grade `randomInt` (uniform, no modulo bias), and the taker's
+ * new index falls out of the shuffle — every position equiprobable.
+ *
+ * The shuffled order is BINDING from here on: it is the order that gets
+ * signed (B6 folds the ring bytes into every challenge) and hashed into
+ * the binding's ring_hash (B2), so reordering after construction breaks
+ * verification.
+ */
+export function buildShuffledRing(
+  makerPublicKeys: Uint8Array[],
+  takerLocalIndex: number,
+  decoys: Uint8Array[] = [],
+): { ring: Uint8Array[]; takerIndex: number } {
+  if (takerLocalIndex < 0 || takerLocalIndex >= makerPublicKeys.length) {
+    throw new Error("takerLocalIndex out of range");
+  }
+  const entries = [
+    ...makerPublicKeys.map((pk, i) => ({ pk, isTaker: i === takerLocalIndex })),
+    ...decoys.map((pk) => ({ pk, isTaker: false })),
+  ];
+  for (let i = entries.length - 1; i > 0; i--) {
+    const j = randomInt(i + 1);
+    [entries[i], entries[j]] = [entries[j], entries[i]];
+  }
+  return {
+    ring: entries.map((e) => e.pk),
+    takerIndex: entries.findIndex((e) => e.isTaker),
+  };
 }
 
 // ─── CLI flags ─────────────────────────────────────────────────
@@ -721,9 +759,20 @@ export async function main(
 
   const RING_SIZE = 5;
   const keys = Array.from({ length: RING_SIZE }, () => generateKeyPair());
+
+  // The taker is Carol — maker[2] — by IDENTITY; the ring POSITION of
+  // that key is what gets shuffled below (H2), so it changes per run.
+  const takerKeyIndex = 2;
+  const takerSecret = keys[takerKeyIndex].secretKey;
+
   // Ring = generated maker keys + participant npub decoys, assembled
-  // BEFORE signing. The taker still signs with their own key below.
-  const ring = [...keys.map((k) => k.publicKey), ...participantPks];
+  // BEFORE signing with the signer's position UNIFORMLY shuffled (H2 —
+  // kills the fixed-index leak; ring order is binding post-shuffle).
+  const { ring, takerIndex } = buildShuffledRing(
+    keys.map((k) => k.publicKey),
+    takerKeyIndex,
+    participantPks,
+  );
 
   console.log(box("Ring of makers (public keys)", [
     `Ring size: ${ring.length}`,
@@ -748,15 +797,14 @@ export async function main(
     ]));
   }
 
-  // The taker is maker[2] — they will prove membership without revealing which.
-  const takerIndex = 2;
-  const takerSecret = keys[takerIndex].secretKey;
-
+  // The taker is Carol (maker[2]) — they prove membership without
+  // revealing which. Their ring POSITION is the shuffled takerIndex.
   console.log();
   console.log(box("Taker (code provider)", [
-    `Acting as: ${nameOf(takerIndex)} — maker[${takerIndex}] (secret identity)`,
+    `Acting as: ${nameOf(takerKeyIndex)} — maker[${takerKeyIndex}] (secret identity)`,
     info("secret key", truncate(hex(takerSecret), 24)),
-    `The taker knows they are ${nameOf(takerIndex)}, but the`,
+    `ring position: shuffled — index ${takerIndex} of ${ring.length} this run (H2)`,
+    `The taker knows they are ${nameOf(takerKeyIndex)}, but the`,
     "verifier cannot learn this from the signature.",
   ]));
 
@@ -1058,7 +1106,7 @@ export async function main(
   } else {
     console.log(box("5a. Wrong secret key", [
       check("Signature with wrong key rejected", !wrongKeyResult),
-      `The taker must know the secret key for ${nameOf(takerIndex)}`,
+      `The taker must know the secret key for ${nameOf(takerKeyIndex)}`,
       "to produce a valid proof.",
     ]));
 
@@ -1106,7 +1154,7 @@ export async function main(
     "",
     check("ALL SECURITY CHECKS PASSED", allPass),
     "",
-    `Our taker was ${nameOf(takerIndex)} (maker[${takerIndex}]) all along —`,
+    `Our taker was ${nameOf(takerKeyIndex)} (maker[${takerKeyIndex}]) all along —`,
     "the audience never learned which, and neither",
     "did the maker verifying the proof.",
   ]));
