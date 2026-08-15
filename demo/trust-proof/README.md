@@ -258,6 +258,7 @@ The LSAG key image `I = x_s · H(P_s)` IS the nullifier:
 ### Prerequisites
 
 - Node.js 18+ (for `tsx` and native ESM support)
+- Python 3.8+ (stdlib only — used by the [cross-implementation vector suite](#cross-implementation-test-vectors-t3) inside `npm test`)
 - npm or compatible package manager
 
 ### Install
@@ -354,6 +355,37 @@ Presenting this demo live? [PRESENTER.md](PRESENTER.md) has a 1-minute script ke
 npm test
 # or: npx vitest run
 ```
+
+### Cross-Implementation Test Vectors (T3)
+
+`npm test` includes `src/lsag.vectors.test.ts`, a cross-implementation suite
+against [`tools/lsag_ref.py`](tools/lsag_ref.py) — an **independent, pure-stdlib
+Python reimplementation** of LSAG/v2 that shares no code with `src/lsag.ts`:
+
+- **Python → TS:** `lsag_ref.py` emits [`vectors/lsag-vectors.json`](vectors/lsag-vectors.json)
+  (5 valid + 3 tampered: message / response / key image). The TS suite feeds
+  every vector to `verify()` and requires agreement with each `expected` field,
+  plus recomputes every key image as `x_s * H(P_s)`.
+- **TS → Python:** the TS suite signs fresh vectors with `sign()`, writes them
+  to a temp JSON file, and requires `python3 tools/lsag_ref.py verify --file`
+  to classify every one correctly (including a deliberately lying vector that
+  must FAIL — the check is not vacuous).
+
+The Python tool refuses to emit or verify anything until its EC arithmetic
+self-check passes against published secp256k1 constants (x-coords of 1·G, 2·G,
+3·G, n·G = ∞, encoding round-trips):
+
+```bash
+python3 tools/lsag_ref.py selfcheck                              # EC arithmetic gate
+python3 tools/lsag_ref.py generate --out vectors/lsag-vectors.json   # regenerate (deterministic)
+python3 tools/lsag_ref.py verify --file vectors/lsag-vectors.json  # verify any producer's file
+```
+
+The vector suite caught (and now pins) a subtle hash-to-curve detail: TS
+pads its 32-byte digest into a 33-byte candidate with a trailing `0x00`, so
+the effective H2C x-coordinate is `digest[1:32] || 0x00` (documented in
+`lsag_ref.py`). Vectors are generated against the T1 `LSAG/v2` wire format —
+`lsag.ts` itself is untouched.
 
 ### Type Check
 
