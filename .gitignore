@@ -6,3 +6,4 @@
 /packages/app/.flutter-plugins-dependencies
 /packages/cli/build/
 .claude/
+coverage/
