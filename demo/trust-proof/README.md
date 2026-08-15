@@ -113,19 +113,22 @@ A taker who wants to sell to a specific maker checks that maker's kind 3 list (p
    - `H()` is a hash-to-curve function: `H(data) = hash_to_curve("bitblik/trust-nullifier/v1" || data)`
    - Uses try-and-increment: hash with SHA256, attempt to decompress as a secp256k1 point, increment counter until valid
 
-2. **Pick random scalar** `r_s` and compute the first challenge:
+2. **Pick random scalar** `r_s` and compute the first (base) challenge:
    ```
    L_s = r_s · G
    R_s = r_s · H(P_s)
-   c_{s+1} = H(m, L_s, R_s)
+   c_{s+1} = H("LSAG/v2", m, ring, I, L_s, R_s)
    ```
+   Every challenge — the base challenge and each link — folds
+   `(m || ring || I)` ahead of the point components, so the whole chain is
+   bound to the exact message, ring (in order), and key image.
 
 3. **Walk the ring forward** (indices mod N):
    ```
    For i = s+1, s+2, ..., s-1 (wrapping around):
      L_i = r_i · G + c_i · P_i
       R_i = r_i · H(P_i) + c_i · I
-      c_{i+1} = H(m, L_i, R_i)
+      c_{i+1} = H("LSAG/v2", m, ring, I, L_i, R_i)
    ```
    Each `r_i` for `i ≠ s` is a fresh random scalar.
 
@@ -157,12 +160,12 @@ A taker who wants to sell to a specific maker checks that maker's kind 3 list (p
 
 1. **Verify ring matches follow list**: `proof.ring_pubkeys` must match the `p` tags from the maker's own kind 3 event (or be a subset, if subset rings are allowed).
 
-2. **Recompute the ring**:
+2. **Recompute the ring** (challenges use the same LSAG/v2 fold as signing):
    ```
-   c_1 = H(m, r_0 · G + c_0 · P_0, r_0 · H(P_0) + c_0 · I)
-   c_2 = H(m, r_1 · G + c_1 · P_1, r_1 · H(P_1) + c_1 · I)
+   c_1 = H("LSAG/v2", m, ring, I, r_0 · G + c_0 · P_0, r_0 · H(P_0) + c_0 · I)
+   c_2 = H("LSAG/v2", m, ring, I, r_1 · G + c_1 · P_1, r_1 · H(P_1) + c_1 · I)
    ...
-   c_0' = H(m, r_{N-1} · G + c_{N-1} · P_{N-1}, r_{N-1} · H(P_{N-1}) + c_{N-1} · I)
+   c_0' = H("LSAG/v2", m, ring, I, r_{N-1} · G + c_{N-1} · P_{N-1}, r_{N-1} · H(P_{N-1}) + c_{N-1} · I)
    ```
 
 3. **Check closure**: `c_0' == c_0`. If the ring closes, the signature is valid.
@@ -176,11 +179,13 @@ A taker who wants to sell to a specific maker checks that maker's kind 3 list (p
 
 ### 3.5 The Verify Equation (Corrected)
 
-The correct LSAG verify equation (per Liu-Wei-Wong 2004 and Monero's MLSAG implementation) is:
+The correct LSAG verify equation (per Liu-Wei-Wong 2004 and Monero's MLSAG implementation, with the B6 context fold) is:
 
 ```
-c_{i+1} = H(m, r_i · G + c_i · P_i, r_i · H(P_i) + c_i · I)
+c_{i+1} = H("LSAG/v2", m, ring, I, r_i · G + c_i · P_i, r_i · H(P_i) + c_i · I)
 ```
+
+**Domain separation (B6)**: the challenge hash carries the domain tag `LSAG/v2` (bumped from `LSAG/v1`) and folds `(m || ring || I)` into every challenge. Stale v1 signatures, and signatures re-targeted to a different or reordered ring, fail loudly.
 
 | Component | Correct (Liu-Wei-Wong) | Wrong (breaks closure) |
 |-----------|----------------------|----------------------|

@@ -14,14 +14,18 @@
  *
  * Sign (signer index s, secret key x_s, ring P_0..P_{n-1}, message m):
  *   1. I = x_s * H(P_s)
- *   2. pick random r_s;  c_{s+1} = H(m, r_s*G, r_s*H(P_s))
+ *   2. pick random r_s;  c_{s+1} = H(m, ring, I, r_s*G, r_s*H(P_s))
  *   3. for i = s+1, s+2, ..., s-1 (wrapping mod n), i != s:
- *        pick random r_i;  c_{i+1} = H(m, r_i*G + c_i*P_i, r_i*H(P_i) + c_i*I)
+ *        pick random r_i;  c_{i+1} = H(m, ring, I, r_i*G + c_i*P_i, r_i*H(P_i) + c_i*I)
  *   4. close the ring: set r_s = r_s_random - x_s * c_s  (mod n)
  *
  * Verify (message m, ring P_0..P_{n-1}, signature (I, c_0, r_0..r_{n-1})):
- *   for each i:  c_{i+1} = H(m, r_i*G + c_i*P_i, r_i*H(P_i) + c_i*I)
+ *   for each i:  c_{i+1} = H(m, ring, I, r_i*G + c_i*P_i, r_i*H(P_i) + c_i*I)
  *   accept iff c_n == c_0  and I is a valid non-identity point.
+ *
+ * B6: every challenge folds (m || ring || I) and hashes under the LSAG/v2
+ * domain tag, so signatures are bound to their exact verification context
+ * and stale LSAG/v1 proofs fail loudly.
  *
  * CRITICAL: r_i multiplies the generators (G, H(P_i)); c_i multiplies the
  * public keys (P_i, I). Swapping these roles breaks ring closure.
@@ -54,15 +58,27 @@ function concatBytes(...arrays: Uint8Array[]): Uint8Array {
 /**
  * Hash a set of byte items to a scalar mod n. Each item is length-prefixed
  * by a 4-byte big-endian length so concatenation is unambiguous.
+ *
+ * Domain tag is LSAG/v2 (B6): bumped from LSAG/v1 so signatures made under
+ * the old challenge construction fail loudly instead of verifying.
  */
 function hashToScalar(...items: Uint8Array[]): bigint {
-  const parts: Uint8Array[] = [new TextEncoder().encode("LSAG/v1")];
+  const parts: Uint8Array[] = [new TextEncoder().encode("LSAG/v2")];
   for (const it of items) {
     const len = new Uint8Array(4);
     new DataView(len.buffer).setUint32(0, it.length, false);
     parts.push(len, it);
   }
   return bytesToNumberBE(sha256(concatBytes(...parts))) % CURVE_ORDER;
+}
+
+/**
+ * Ordered concat of the ring's pubkey encodings (B6). Ring ORDER is part of
+ * the binding: folding these bytes into every challenge means a signature
+ * can never be re-targeted to a differently-ordered or different ring.
+ */
+function ringBytes(ring: Uint8Array[]): Uint8Array {
+  return concatBytes(...ring);
 }
 
 /** Reduce a bigint mod n into the canonical range [0, n). */
@@ -117,25 +133,32 @@ export interface LSAGSignature {
 }
 
 /**
- * Per-link challenge: c_{i+1} = H(m, r_i*G + c_i*P_i, r_i*H(P_i) + c_i*I)
+ * Per-link challenge: c_{i+1} = H(m, ring, I, r_i*G + c_i*P_i, r_i*H(P_i) + c_i*I)
+ *
+ * B6: every challenge — this one and the base challenge in sign() — folds
+ * (message || ring || keyImage) ahead of the point components, so the whole
+ * chain is bound to the exact verification context. The domain tag is
+ * LSAG/v2 (bumped from LSAG/v1): stale v1 signatures fail loudly.
  *
  * r_i multiplies the generators (G, H(P_i)); c_i multiplies the public
  * keys (P_i, I). This ordering is what makes the ring close: at the signer
  * index s, with r_s = r_s_random - c_s*x_s and P_s = x_s*G, I = x_s*H(P_s),
- * the c_s*x_s terms cancel and verify recomputes c_{s+1} = H(m, r_s_random*G,
- * r_s_random*H(P_s)) — exactly what the signer stored.
+ * the c_s*x_s terms cancel and verify recomputes c_{s+1} = H(m, ring, I,
+ * r_s_random*G, r_s_random*H(P_s)) — exactly what the signer stored.
  */
 function linkChallenge(
   message: Uint8Array,
+  ring: Uint8Array,
+  keyImage: Uint8Array,
   c: bigint,
   r: bigint,
   Pi: Uint8Array,
   Hi: Uint8Array,
-  I: Uint8Array,
 ): bigint {
+  const I = Point.fromBytes(keyImage);
   const z1 = Point.BASE.multiply(r).add(Point.fromBytes(Pi).multiply(c));
-  const z2 = Point.fromBytes(Hi).multiply(r).add(Point.fromBytes(I).multiply(c));
-  return hashToScalar(message, z1.toBytes(), z2.toBytes());
+  const z2 = Point.fromBytes(Hi).multiply(r).add(I.multiply(c));
+  return hashToScalar(message, ring, keyImage, z1.toBytes(), z2.toBytes());
 }
 
 /**
@@ -166,6 +189,9 @@ export function sign(
   // Key image: I = x_s * H(P_s)
   const I = Point.fromBytes(H[s]).multiply(x_s).toBytes();
 
+  // B6: the ring encoding is folded into every challenge below.
+  const R = ringBytes(ring);
+
   // Random responses for all non-signer positions.
   const responses: bigint[] = new Array(n);
   for (let i = 0; i < n; i++) {
@@ -177,9 +203,12 @@ export function sign(
   // Store each challenge in an array indexed by ring position.
   const challenges: bigint[] = new Array(n);
 
-  // c_{s+1} = H(m, r_s*G, r_s*H(P_s))  (uses the *random* r_s, not the final one)
+  // Base challenge (B6): c_{s+1} = H(m, ring, I, r_s*G, r_s*H(P_s))
+  // (uses the *random* r_s, not the final one; folds msg || ring || keyImage)
   let c = hashToScalar(
     message,
+    R,
+    I,
     Point.BASE.multiply(r_s_random).toBytes(),
     Point.fromBytes(H[s]).multiply(r_s_random).toBytes(),
   );
@@ -187,7 +216,7 @@ export function sign(
 
   for (let step = 1; step < n; step++) {
     const i = (s + step) % n;
-    c = linkChallenge(message, c, responses[i], ring[i], H[i], I);
+    c = linkChallenge(message, R, I, c, responses[i], ring[i], H[i]);
     challenges[(i + 1) % n] = c;
   }
   // `c` is now c_s — the challenge arriving back at the signer index.
@@ -238,11 +267,16 @@ export function verify(
     }
   }
 
+  // B6: challenges fold (message || ring || keyImage) under LSAG/v2 —
+  // the same construction sign() used, so re-targeted or stale (v1)
+  // signatures cannot close the ring.
+  const R = ringBytes(ring);
+
   let c = bytesToNumberBE(sig.c0) % CURVE_ORDER;
   for (let i = 0; i < n; i++) {
     const r = bytesToNumberBE(sig.responses[i]) % CURVE_ORDER;
     try {
-      c = linkChallenge(message, c, r, ring[i], H[i], sig.keyImage);
+      c = linkChallenge(message, R, sig.keyImage, c, r, ring[i], H[i]);
     } catch {
       return false;
     }

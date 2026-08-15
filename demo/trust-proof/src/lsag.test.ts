@@ -297,4 +297,19 @@ describe("B6: challenge hash binds (msg || ring || keyImage) under LSAG/v2", () 
     });
     expect(verify(message, ring, sig)).toBe(false);
   });
+
+  it("rejects the same signature verified against a different ring (fold is enforced at verify time)", () => {
+    const sig = sign(message, ring, 1, keys[1].secretKey);
+    // same size, one member swapped — response count matches, so only the
+    // challenge fold can (and must) break the ring walk
+    const other = generateKeyPair();
+    const ringB = [ring[0], ring[1], other.publicKey, ring[3]];
+    expect(verify(message, ringB, sig)).toBe(false);
+  });
+
+  it("rejects the same signature verified against a reordered ring (ring order is binding)", () => {
+    const sig = sign(message, ring, 1, keys[1].secretKey);
+    const reordered = [ring[1], ring[0], ring[2], ring[3]];
+    expect(verify(message, reordered, sig)).toBe(false);
+  });
 });
