@@ -134,8 +134,13 @@ describe("hashToCurve", () => {
 });
 
 describe("sign and verify", () => {
-  it("verifies a valid signature (ring of 3)", () => {
-    const keys = [generateKeyPair(), generateKeyPair(), generateKeyPair()];
+  it("verifies a valid signature (ring of 4)", () => {
+    const keys = [
+      generateKeyPair(),
+      generateKeyPair(),
+      generateKeyPair(),
+      generateKeyPair(),
+    ];
     const ring = keys.map((k) => k.publicKey);
     const message = enc.encode("test message");
     const sig = sign(message, ring, 1, keys[1].secretKey);
@@ -158,7 +163,12 @@ describe("sign and verify", () => {
   });
 
   it("rejects a tampered message", () => {
-    const keys = [generateKeyPair(), generateKeyPair(), generateKeyPair()];
+    const keys = [
+      generateKeyPair(),
+      generateKeyPair(),
+      generateKeyPair(),
+      generateKeyPair(),
+    ];
     const ring = keys.map((k) => k.publicKey);
     const message = enc.encode("original message");
     const sig = sign(message, ring, 0, keys[0].secretKey);
@@ -166,7 +176,12 @@ describe("sign and verify", () => {
   });
 
   it("rejects a tampered response", () => {
-    const keys = [generateKeyPair(), generateKeyPair(), generateKeyPair()];
+    const keys = [
+      generateKeyPair(),
+      generateKeyPair(),
+      generateKeyPair(),
+      generateKeyPair(),
+    ];
     const ring = keys.map((k) => k.publicKey);
     const message = enc.encode("test message");
     const sig = sign(message, ring, 1, keys[1].secretKey);
@@ -178,7 +193,12 @@ describe("sign and verify", () => {
   });
 
   it("rejects a tampered key image", () => {
-    const keys = [generateKeyPair(), generateKeyPair(), generateKeyPair()];
+    const keys = [
+      generateKeyPair(),
+      generateKeyPair(),
+      generateKeyPair(),
+      generateKeyPair(),
+    ];
     const ring = keys.map((k) => k.publicKey);
     const message = enc.encode("test message");
     const sig = sign(message, ring, 1, keys[1].secretKey);
@@ -187,14 +207,6 @@ describe("sign and verify", () => {
       keyImage: secp256k1.Point.BASE.toBytes(),
     };
     expect(verify(message, ring, tampered)).toBe(false);
-  });
-
-  it("works with a ring of 1", () => {
-    const keys = [generateKeyPair()];
-    const ring = keys.map((k) => k.publicKey);
-    const message = enc.encode("test");
-    const sig = sign(message, ring, 0, keys[0].secretKey);
-    expect(verify(message, ring, sig)).toBe(true);
   });
 
   it("works with a larger ring (10 members)", () => {
@@ -208,7 +220,12 @@ describe("sign and verify", () => {
   });
 
   it("rejects signature when wrong secret key is used", () => {
-    const keys = [generateKeyPair(), generateKeyPair(), generateKeyPair()];
+    const keys = [
+      generateKeyPair(),
+      generateKeyPair(),
+      generateKeyPair(),
+      generateKeyPair(),
+    ];
     const ring = keys.map((k) => k.publicKey);
     const message = enc.encode("test message");
     const wrong = generateKeyPair();
@@ -311,5 +328,51 @@ describe("B6: challenge hash binds (msg || ring || keyImage) under LSAG/v2", () 
     const sig = sign(message, ring, 1, keys[1].secretKey);
     const reordered = [ring[1], ring[0], ring[2], ring[3]];
     expect(verify(message, reordered, sig)).toBe(false);
+  });
+});
+
+describe("B4: verify rejects degenerate rings", () => {
+  const keys = Array.from({ length: 4 }, () => generateKeyPair());
+  const ring = keys.map((k) => k.publicKey);
+  const message = enc.encode("B4 degenerate ring test");
+
+  it("rejects a ring of 3 pubkeys — minimum ring size is 4", () => {
+    const three = ring.slice(0, 3);
+    const sig = sign(message, three, 0, keys[0].secretKey);
+    expect(sig.responses).toHaveLength(3); // well-formed signature…
+    expect(verify(message, three, sig)).toBe(false); // …over a too-small ring
+  });
+
+  it("rejects a ring of 1 pubkey", () => {
+    const one = [ring[0]];
+    const sig = sign(message, one, 0, keys[0].secretKey);
+    expect(verify(message, one, sig)).toBe(false);
+  });
+
+  it("rejects duplicate points in the ring (same pubkey listed twice)", () => {
+    const dupRing = [ring[0], ring[1], ring[2], ring[0]];
+    const sig = sign(message, dupRing, 1, keys[1].secretKey);
+    expect(verify(message, dupRing, sig)).toBe(false);
+  });
+
+  it("rejects duplicate points listed under different encodings (compressed + uncompressed)", () => {
+    const uncompressed = secp256k1.Point.fromBytes(ring[3]).toBytes(false);
+    expect(uncompressed).toHaveLength(65); // valid point, non-canonical encoding
+    const dupRing = [ring[0], ring[1], ring[2], uncompressed];
+    const sig = sign(message, dupRing, 1, keys[1].secretKey);
+    expect(verify(message, dupRing, sig)).toBe(false);
+  });
+
+  it("rejects non-canonical point encodings (uncompressed 65-byte entry)", () => {
+    const uncompressed = secp256k1.Point.fromBytes(ring[2]).toBytes(false);
+    const ringU = [ring[0], ring[1], uncompressed, ring[3]];
+    const sig = sign(message, ringU, 1, keys[1].secretKey);
+    expect(verify(message, ringU, sig)).toBe(false);
+  });
+
+  it("rejects wrong-size encodings (32-byte entry) without throwing", () => {
+    const bad = [ring[0], ring[1], ring[2], ring[3].slice(1)] as Uint8Array[];
+    const sig = sign(message, ring, 1, keys[1].secretKey);
+    expect(verify(message, bad, sig)).toBe(false);
   });
 });
