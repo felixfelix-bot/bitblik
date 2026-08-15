@@ -29,7 +29,7 @@ import { generateKeyPair, sign, verify } from "./lsag.js";
 import {
   generatePublisher,
   buildNostrEvent,
-  proofFromWireEvent,
+  verifyProofEvent,
   buildBindingMessage,
   bindingToJson,
   ringHash,
@@ -210,9 +210,10 @@ export async function runPreflight(): Promise<PreflightResult> {
     if (!schnorr.verify(event.sig, hexToBytes(event.id), event.pubkey)) {
       throw new Error("schnorr: envelope signature does not verify");
     }
-    const fromWire = proofFromWireEvent(wireEvent);
-    if (!verify(fromWire.message, fromWire.ring, fromWire.sig)) {
-      throw new Error("lsag: proof rebuilt from the wire does not verify");
+    // B1: verify against OUR OWN ring (caller-supplied); the event's ring
+    // tag is display-only and never trusted for verification.
+    if (!verifyProofEvent(wireEvent, ring)) {
+      throw new Error("lsag: proof rebuilt from the wire does not verify against OUR ring");
     }
   } finally {
     ws.terminate();

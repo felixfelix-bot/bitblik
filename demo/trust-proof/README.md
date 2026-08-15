@@ -162,7 +162,7 @@ A taker who wants to sell to a specific maker checks that maker's kind 3 list (p
 
 1. **Reject degenerate rings** (B4): fewer than 4 pubkeys, any duplicate point (the same key twice, or the same point under different encodings), or any non-canonical point encoding (only 33-byte compressed `0x02`/`0x03` entries are accepted — uncompressed 65-byte forms are rejected outright).
 
-2. **Verify ring matches follow list**: `proof.ring_pubkeys` must match the `p` tags from the maker's own kind 3 event (or be a subset, if subset rings are allowed).
+2. **Verify ring matches follow list** (B1): the maker verifies against THEIR OWN kind 3 follow list — the `ring` tag inside the proof event is DISPLAY-ONLY (shown to humans, never trusted for verification). `proof.ring_pubkeys` must match the `p` tags from the maker's own kind 3 event (or be a subset, if subset rings are allowed). A lying or reordered ring tag cannot make a proof verify; the caller's ring is the only one that matters.
 
 3. **Recompute the ring** (challenges use the same LSAG/v2 fold as signing):
    ```

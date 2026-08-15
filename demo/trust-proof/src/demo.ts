@@ -590,20 +590,24 @@ async function relayFetchProof(url: string, expectedId: string): Promise<NostrEv
 }
 
 /**
- * Rebuild the verification inputs strictly from what crossed the wire:
- * the LSAG proof and trade binding from event content. The signed message
- * is re-derived from the carried binding via the same canonical encoding
+ * Rebuild the proof inputs strictly from what crossed the wire: the LSAG
+ * proof and trade binding from event content. The signed message is
+ * re-derived from the carried binding via the same canonical encoding
  * the taker used (B2). Nothing from the taker's local variables.
+ *
+ * B1: the event's `ring` tag is DISPLAY-ONLY. It is parsed into
+ * `displayRing` for human presentation but is NEVER returned as a
+ * verification input — the maker always verifies against their own
+ * kind-3 ring via verifyProofEvent()/verify().
  *
  * Exported since R4: `npm run preflight` runs the same maker-side rebuild.
  */
 export function proofFromWireEvent(
   ev: NostrEvent,
-): { ring: Uint8Array[]; sig: LSAGSignature; message: Uint8Array; binding: TradeBinding } {
+): { displayRing: Uint8Array[]; sig: LSAGSignature; message: Uint8Array; binding: TradeBinding } {
   const ringTag = ev.tags.find((t) => t[0] === "ring");
-  if (ringTag === undefined || ringTag.length < 2) {
-    throw new Error("wire event carries no ring tag");
-  }
+  const displayRing: Uint8Array[] =
+    ringTag === undefined ? [] : ringTag.slice(1).map((pk) => hexToBytes(pk));
   const body = JSON.parse(ev.content) as {
     binding?: {
       amount?: unknown;
@@ -639,7 +643,7 @@ export function proofFromWireEvent(
     ringHash: b.ring_hash,
   };
   return {
-    ring: ringTag.slice(1).map((pk) => hexToBytes(pk)),
+    displayRing,
     sig: {
       keyImage: hexToBytes(body.keyImage),
       c0: hexToBytes(body.c0),
@@ -648,6 +652,20 @@ export function proofFromWireEvent(
     binding,
     message: buildBindingMessage(binding),
   };
+}
+
+/**
+ * Maker-side verification (B1): check a wire proof event against the
+ * CALLER-SUPPLIED ring — the maker's own kind-3 trust list. The event's
+ * `ring` tag is never consulted (display-only): a lying tag cannot make
+ * a proof verify, and an honest one is not needed. As a loud early
+ * check, the carried binding's ring_hash must match the caller's ring —
+ * the proof must have been signed over exactly this ring, in this order.
+ */
+export function verifyProofEvent(ev: NostrEvent, ring: Uint8Array[]): boolean {
+  const { sig, message, binding } = proofFromWireEvent(ev);
+  if (binding.ringHash !== ringHash(ring)) return false;
+  return verify(message, ring, sig);
 }
 
 // ─── Demo ───────────────────────────────────────────────────────
@@ -848,10 +866,13 @@ export async function main(
       "or invalid (outsider — walk away). Anonymity intact either way.",
   );
 
-  // R3: REAL transport. The taker publishes the signed kind 30221 event
-  // to a Nostr relay; the maker receives it over the wire like a separate
-  // app would, then rebuilds ring + proof FROM THE EVENT — not local vars.
-  let verifyRing = ring;
+  // R3 + B1: REAL transport. The taker publishes the signed kind 30221
+  // event to a Nostr relay; the maker receives it over the wire like a
+  // separate app would, rebuilds the proof from event CONTENT — and then
+  // verifies against the MAKER'S OWN kind-3 ring, never the event's
+  // ring tag (that tag is display-only).
+  const makerRing = [...keys.map((k) => k.publicKey), ...participantPks];
+  let verifyRing = makerRing;
   let verifySig = sig;
   let verifyMessage: Uint8Array = message;
   let viaLine = "proof arrived via: offline (local variables)";
@@ -879,9 +900,26 @@ export async function main(
         console.log("← maker: REQ {kinds:[30221]} → proof received over the wire");
         const fromWire = proofFromWireEvent(wireEvent);
         console.log(
-          `maker: ring rebuilt from event tags (${fromWire.ring.length} pubkeys) — LSAG proof from event content`,
+          `maker: LSAG proof + trade binding rebuilt from event content — ring tag (${fromWire.displayRing.length} pubkeys) is DISPLAY-ONLY`,
         );
-        verifyRing = fromWire.ring;
+        // B1: the maker verifies against THEIR OWN trust ring (kind 3),
+        // built here from the maker's own key list — not from the event.
+        console.log(
+          `maker: verifying against MY OWN trust ring (${makerRing.length} pubkeys, kind 3)`,
+        );
+        // B1 on-stage proof: tamper the event's ring tag — verification
+        // must not care (the tag never reaches the math).
+        const lyingTagEv: NostrEvent = {
+          ...wireEvent,
+          tags: wireEvent.tags.map((t) =>
+            t[0] === "ring" ? ["ring", ...t.slice(1).reverse()] : t,
+          ),
+        };
+        const lyingTagIgnored = verifyProofEvent(lyingTagEv, makerRing);
+        console.log(
+          check("ring tag tampered — verification IGNORES it (display-only)", lyingTagIgnored),
+        );
+        verifyRing = makerRing;
         verifySig = fromWire.sig;
         verifyMessage = fromWire.message;
         viaLine = `proof arrived via: REAL Nostr relay (event ${truncate(wireEvent.id, 12)})`;
